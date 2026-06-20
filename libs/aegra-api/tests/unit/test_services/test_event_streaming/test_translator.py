@@ -67,9 +67,9 @@ class TestMessageTranslation:
 
 
 class TestOtherChannels:
-    def test_values(self) -> None:
+    def test_values_carries_state_dict_directly(self) -> None:
         t = EventTranslator()
-        assert t.translate("values", {"count": 1}) == [("values", {"values": {"count": 1}})]
+        assert t.translate("values", {"count": 1}) == [("values", {"count": 1})]
 
     def test_updates_one_event_per_node(self) -> None:
         t = EventTranslator()

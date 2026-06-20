@@ -74,7 +74,8 @@ class EventTranslator:
         if mode == "messages":
             return self._translate_message(payload)
         if mode == "values":
-            return [("values", {"values": payload})]
+            # The values channel carries the state dict directly as params.
+            return [("values", payload if isinstance(payload, dict) else {"value": payload})]
         if mode == "updates":
             return self._translate_updates(payload)
         if mode == "custom":
