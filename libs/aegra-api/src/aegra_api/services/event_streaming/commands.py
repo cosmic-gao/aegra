@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.models import User
 from aegra_api.models.runs import RunCreate
+from aegra_api.services.event_streaming.channels import DEFAULT_RUN_STREAM_MODES
 from aegra_api.services.event_streaming.protocol import ErrorCode, build_error, build_success
 from aegra_api.services.run_preparation import _prepare_run
 
@@ -93,6 +94,7 @@ async def _run_start(
         input=params.get("input"),
         config=params.get("config") or {},
         metadata=params.get("metadata"),
+        stream_mode=list(DEFAULT_RUN_STREAM_MODES),
     )
     run_id = await _start(session, thread_id, request, user)
     return build_success(command_id, {"run_id": run_id}), run_id
@@ -117,6 +119,7 @@ async def _input_respond(
         assistant_id=assistant_id,
         config=params.get("config") or {},
         command={"resume": params["response"]},
+        stream_mode=list(DEFAULT_RUN_STREAM_MODES),
     )
     run_id = await _start(session, thread_id, request, user)
     return build_success(command_id, {"run_id": run_id}), run_id

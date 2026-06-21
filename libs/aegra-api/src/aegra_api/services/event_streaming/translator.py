@@ -9,7 +9,8 @@ that into the protocol's content-block lifecycle —
 ``message-start`` → ``content-block-delta`` (one per token) →
 ``message-finish`` — keyed by message id, so the wire output is the same
 shape the LangGraph JS/Python SDKs consume regardless of how the model
-chunks its tokens.
+chunks its tokens. Text and reasoning are separate content blocks, so a
+thinking model's reasoning streams as ``reasoning-delta`` on its own index.
 """
 
 from __future__ import annotations
@@ -19,21 +20,44 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, BaseMessageChunk
 
-# Index of the single text content block we emit per message. Multi-block
-# messages (mixed text/reasoning/tool-calls) are a follow-up; today we
-# project the text stream, which is what chat UIs render.
+# Stable content-block indices per message: text and reasoning are distinct
+# blocks, so a client renders the chain-of-thought separately from the answer.
 _TEXT_BLOCK_INDEX = 0
+_REASONING_BLOCK_INDEX = 1
+
+# (delta type, content-block index) for each kind of message delta.
+_DELTA_KINDS: dict[str, tuple[str, int]] = {
+    "text": ("text-delta", _TEXT_BLOCK_INDEX),
+    "reasoning": ("reasoning-delta", _REASONING_BLOCK_INDEX),
+}
 
 
-def _message_text(message: Any) -> str:
-    """Best-effort text of a message chunk (content may be str or block list)."""
+def _message_deltas(message: Any) -> list[tuple[str, str]]:
+    """Ordered ``(kind, text)`` deltas from a chunk, where kind is text/reasoning.
+
+    Pulls text and reasoning out of the chunk's content (str or block list)
+    and the ``reasoning_content`` additional_kwarg some providers use.
+    """
+    deltas: list[tuple[str, str]] = []
     content = getattr(message, "content", "")
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [block.get("text", "") for block in content if isinstance(block, dict)]
-        return "".join(parts)
-    return str(content)
+        if content:
+            deltas.append(("text", content))
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "reasoning" and (text := block.get("reasoning")):
+                deltas.append(("reasoning", text))
+            elif text := block.get("text"):
+                deltas.append(("text", text))
+
+    extra = getattr(message, "additional_kwargs", None)
+    if isinstance(extra, dict) and (reasoning := extra.get("reasoning_content")):
+        deltas.append(("reasoning", reasoning))
+
+    return deltas
 
 
 def _message_role(message: Any) -> str:
@@ -78,10 +102,14 @@ class EventTranslator:
             return [("values", payload if isinstance(payload, dict) else {"value": payload}, [])]
         if mode == "updates":
             return self._translate_updates(payload)
+        if mode == "tools":
+            return [("tools", payload if isinstance(payload, dict) else {"payload": payload}, [])]
         if mode == "custom":
             return [("custom", {"payload": payload}, [])]
         if mode == "tasks":
             return [("tasks", payload if isinstance(payload, dict) else {"payload": payload}, [])]
+        if mode == "checkpoints":
+            return [("checkpoints", payload if isinstance(payload, dict) else {"payload": payload}, [])]
         return []
 
     def _translate_message(self, payload: Any) -> list[tuple[str, dict[str, Any], list[str]]]:
@@ -114,15 +142,15 @@ class EventTranslator:
                 )
             )
 
-        text = _message_text(message)
-        if text:
+        for kind, text in _message_deltas(message):
+            delta_type, index = _DELTA_KINDS[kind]
             events.append(
                 (
                     "messages",
                     {
                         "event": "content-block-delta",
-                        "index": _TEXT_BLOCK_INDEX,
-                        "delta": {"type": "text-delta", "text": text},
+                        "index": index,
+                        "delta": {"type": delta_type, kind: text},
                     },
                     [],
                 )

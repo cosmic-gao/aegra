@@ -35,11 +35,15 @@ def is_supported_channel(channel: str) -> bool:
 
 
 # stream_mode set requested from langgraph on every v2 run. Drives which
-# raw modes the translator can turn into channel events.
+# raw modes the translator can turn into channel events. "lifecycle" and
+# "input" are derived by the session (from terminal/interrupt signals), not
+# langgraph stream modes, so they are not requested here.
 DEFAULT_RUN_STREAM_MODES: list[str] = [
     "values",
     "updates",
     "messages",
+    "tools",
     "custom",
     "tasks",
+    "checkpoints",
 ]

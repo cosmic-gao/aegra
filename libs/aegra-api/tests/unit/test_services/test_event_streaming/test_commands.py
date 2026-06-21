@@ -48,6 +48,10 @@ class TestRunStart:
         assert request.assistant_id == "agent"
         assert request.input == {"x": 1}
         assert request.config == {"c": 2}
+        # v2 runs request the full default stream-mode set so every channel can carry data.
+        assert "tools" in request.stream_mode
+        assert "checkpoints" in request.stream_mode
+        assert "messages" in request.stream_mode
 
     async def test_run_start_missing_assistant_id_is_invalid(self, prepared_run: AsyncMock, user: User) -> None:
         resp, run_id = await _dispatch({"id": 1, "method": "run.start", "params": {"input": {}}}, user)

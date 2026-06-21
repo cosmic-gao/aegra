@@ -95,10 +95,53 @@ class TestOtherChannels:
         t = EventTranslator()
         assert t.translate("custom", {"foo": "bar"}) == [("custom", {"payload": {"foo": "bar"}}, [])]
 
+    def test_tools_passthrough(self) -> None:
+        t = EventTranslator()
+        assert t.translate("tools", {"tool_call_id": "c1"}) == [("tools", {"tool_call_id": "c1"}, [])]
+
+    def test_checkpoints_passthrough(self) -> None:
+        t = EventTranslator()
+        assert t.translate("checkpoints", {"id": "ck1"}) == [("checkpoints", {"id": "ck1"}, [])]
+
     def test_unhandled_modes_return_nothing(self) -> None:
         t = EventTranslator()
         for mode in ("metadata", "debug", "end", "error"):
             assert t.translate(mode, {"anything": True}) == []
+
+
+class TestReasoning:
+    def test_reasoning_block_emits_reasoning_delta_on_its_own_index(self) -> None:
+        """A reasoning content block streams as reasoning-delta at index 1."""
+        t = EventTranslator()
+        chunk = AIMessageChunk(content=[{"type": "reasoning", "reasoning": "thinking..."}], id="m1")
+        events = t.translate("messages", (chunk, {}))
+        deltas = [e[1] for e in events if e[1]["event"] == "content-block-delta"]
+        assert deltas == [
+            {
+                "event": "content-block-delta",
+                "index": 1,
+                "delta": {"type": "reasoning-delta", "reasoning": "thinking..."},
+            }
+        ]
+
+    def test_text_and_reasoning_are_separate_blocks(self) -> None:
+        t = EventTranslator()
+        chunk = AIMessageChunk(
+            content=[{"type": "reasoning", "reasoning": "hmm"}, {"type": "text", "text": "answer"}],
+            id="m1",
+        )
+        events = t.translate("messages", (chunk, {}))
+        deltas = [(e[1]["index"], e[1]["delta"]["type"]) for e in events if e[1]["event"] == "content-block-delta"]
+        assert (1, "reasoning-delta") in deltas
+        assert (0, "text-delta") in deltas
+
+    def test_reasoning_content_kwarg_is_picked_up(self) -> None:
+        """Providers that put reasoning in additional_kwargs are handled too."""
+        t = EventTranslator()
+        chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": "deep thought"}, id="m1")
+        events = t.translate("messages", (chunk, {}))
+        deltas = [e[1]["delta"] for e in events if e[1]["event"] == "content-block-delta"]
+        assert {"type": "reasoning-delta", "reasoning": "deep thought"} in deltas
 
 
 class TestChannelTripleShape:
