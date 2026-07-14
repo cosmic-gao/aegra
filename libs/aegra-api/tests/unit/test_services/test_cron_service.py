@@ -196,6 +196,33 @@ class TestCreateCron:
         assert result is not None
 
     @pytest.mark.asyncio
+    async def test_honors_client_provided_cron_id(
+        self,
+        cron_service: CronService,
+        mock_session: AsyncMock,
+    ) -> None:
+        mock_session.scalar.side_effect = [_make_assistant_orm(), None]
+        req = CronCreate(cron_id="cron-custom", assistant_id="asst-001", schedule="*/5 * * * *")
+
+        await cron_service.create_cron(req, "test-user")
+
+        added = mock_session.add.call_args[0][0]
+        assert added.cron_id == "cron-custom"
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_cron_id(
+        self,
+        cron_service: CronService,
+        mock_session: AsyncMock,
+    ) -> None:
+        mock_session.scalar.side_effect = [_make_assistant_orm(), _make_cron_orm()]
+        req = CronCreate(cron_id="cron-dup", assistant_id="asst-001", schedule="*/5 * * * *")
+
+        with pytest.raises(HTTPException) as exc:
+            await cron_service.create_cron(req, "test-user")
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
     async def test_rejects_invalid_schedule(
         self,
         cron_service: CronService,
