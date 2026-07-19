@@ -25,6 +25,7 @@ from aegra_api.models.store import (
     StoreListNamespacesRequest,
     StoreListNamespacesResponse,
     StorePutRequest,
+    StoreSearchItem,
     StoreSearchRequest,
     StoreSearchResponse,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "StoreSearchRequest",
     "StoreSearchResponse",
     "StoreItem",
+    "StoreSearchItem",
     "StoreDeleteRequest",
     "StoreListNamespacesRequest",
     "StoreListNamespacesResponse",

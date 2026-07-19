@@ -11,7 +11,9 @@ Architecture:
 - Service Layer (assistant_service.py): Business logic, validation, orchestration
 """
 
-from fastapi import APIRouter, Body, Depends, Query
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, Query, Response
 
 from aegra_api.core.auth_deps import auth_dependency
 from aegra_api.core.orm import Assistant as AssistantORM
@@ -68,18 +70,27 @@ async def list_assistants(
     return AssistantList(assistants=assistants, total=len(assistants))
 
 
-@router.post("/assistants/search", response_model=list[Assistant], response_model_by_alias=False)
+# response_model=None: with `select` the items are partial dicts, so the
+# service serializes and the route passes them through untouched.
+@router.post("/assistants/search", response_model=None)
 async def search_assistants(
     request: AssistantSearchRequest,
+    response: Response,
     service: AssistantService = Depends(get_assistant_service),
-):
+) -> list[dict[str, Any]]:
     """Search assistants with filters.
 
     Filter by name, description, graph ID, or metadata. Results are paginated
-    via `limit` and `offset`.
+    via `limit` and `offset`; use `select` to return only specific fields.
+    Pagination info is exposed via the `X-Pagination-Total` header, plus
+    `X-Pagination-Next` when more results exist.
     """
     column, asc = _resolve_sort(request)
-    return await service.search_assistants(request, sort_column=column, sort_asc=asc)
+    page = await service.search_assistants(request, sort_column=column, sort_asc=asc)
+    response.headers["X-Pagination-Total"] = str(page.total)
+    if page.next_offset is not None:
+        response.headers["X-Pagination-Next"] = str(page.next_offset)
+    return page.items
 
 
 @router.post("/assistants/count", response_model=int)
@@ -135,14 +146,16 @@ async def update_assistant(
 @router.delete("/assistants/{assistant_id}", responses={**NOT_FOUND})
 async def delete_assistant(
     assistant_id: str,
+    delete_threads: bool = Query(False, description="Also delete threads whose metadata binds them to this assistant."),
     service: AssistantService = Depends(get_assistant_service),
-):
+) -> dict[str, str]:
     """Delete an assistant by its ID.
 
     Permanently removes the assistant and all of its versions. This action
-    cannot be undone.
+    cannot be undone. Pass `delete_threads=true` to also delete the caller's
+    threads created by this assistant.
     """
-    return await service.delete_assistant(assistant_id)
+    return await service.delete_assistant(assistant_id, delete_threads=delete_threads)
 
 
 @router.post(
@@ -223,11 +236,22 @@ async def get_assistant_subgraphs(
     recurse: bool = Query(False, description="Recursively include nested subgraphs."),
     namespace: str | None = Query(None, description="Filter to a specific subgraph namespace."),
     service: AssistantService = Depends(get_assistant_service),
-):
+) -> dict[str, Any]:
     """Get subgraphs of an assistant.
 
     Returns the subgraph definitions used by this assistant's graph. Set
     `recurse=true` to include deeply nested subgraphs, or filter to a single
     namespace.
     """
+    return await service.get_assistant_subgraphs(assistant_id, namespace, recurse)
+
+
+@router.get("/assistants/{assistant_id}/subgraphs/{namespace}", responses={**NOT_FOUND})
+async def get_assistant_subgraphs_namespace(
+    assistant_id: str,
+    namespace: str,
+    recurse: bool = Query(False, description="Recursively include nested subgraphs."),
+    service: AssistantService = Depends(get_assistant_service),
+) -> dict[str, Any]:
+    """Namespace-scoped subgraph lookup — the path form the LangGraph SDK calls."""
     return await service.get_assistant_subgraphs(assistant_id, namespace, recurse)

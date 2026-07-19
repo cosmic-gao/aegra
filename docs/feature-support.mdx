@@ -30,6 +30,11 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | State persistence | Supported | PostgreSQL checkpoints via LangGraph. |
 | Thread state inspection | Supported | Get current state, values, and next nodes for any thread. |
 | Thread history | Supported | Full checkpoint history with replay capability. |
+| Thread copy | Supported | `POST /threads/{id}/copy` forks a thread with its full checkpoint history into a new thread. |
+| Thread prune | Supported | `POST /threads/prune` deletes threads by id, or `keep_latest` drops all but the newest checkpoint per namespace. |
+| Thread search projection | Supported | `select` projects fields, `extract` pulls dot/bracket paths, and `values`/`ids` filter on the latest state. Latest state is materialized into a 1:1 `thread_state` table (not the wide thread row), so list/search omit `values`/`interrupts` unless `select`ed; the checkpointer stays the source of truth. |
+| Per-thread TTL | Supported | `ttl` on create/update sets retention; `include=ttl` returns it. |
+| Thread supersteps | Supported | `supersteps` on create seeds the thread's state (Studio initial state). |
 
 ### Runs and execution
 
@@ -42,6 +47,15 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Subgraph streaming | Supported | Stream events from nested subgraphs. |
 | Stateless runs | Supported | Execute without persisting thread state. |
 | Cron / scheduled jobs | Supported | Trigger runs on a schedule. Standard and seconds-level cron expressions. IANA timezone support. |
+| Double-texting | Supported | `multitask_strategy`: `reject` (default) / `interrupt` / `rollback` / `enqueue`. At most one run executes per thread at a time. |
+| Cancel | Supported | `POST .../cancel` with `action`: `interrupt` / `cancel` / `rollback` (rollback deletes the run and its checkpoints). |
+| Bulk cancel | Supported | `POST /runs/cancel` cancels by `status` (pending/running/all) or `thread_id` + `run_ids`. |
+| Batch runs | Supported | `POST /runs/batch` creates many stateless background runs in one request (bounded concurrency). |
+| Delayed runs | Supported | `after_seconds` schedules a run to start after a delay; a background scheduler submits it when due. |
+| Checkpoint durability | Supported | Per-run `durability`: `async` (default) / `sync` / `exit`, forwarded to the LangGraph runtime. `checkpoint_during` is accepted as a deprecated alias. |
+| Webhook callbacks | Supported | POST the final Run payload to a `webhook` URL on terminal state. Bounded retry with jitter (tenacity), optional HMAC signing, SSRF guard. |
+| `if_not_exists` | Supported | Run creation on a missing thread: `reject` (default, 404) or `create`. |
+| Thread count | Supported | `POST /threads/count` returns the number of threads matching the search filters. |
 
 ### Scaling and reliability
 
@@ -69,6 +83,10 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 |:--|:--|:--|
 | Key-value store | Supported | Namespaced key-value storage with listing and search. |
 | Semantic search | Supported | Vector embeddings via pgvector. Configurable embedding models. |
+| Store TTL | Supported | `store.ttl` config plus per-request `ttl`/`index` on put and `refresh_ttl` on get/search. |
+| Thread retention (TTL) | Supported | Opt-in `CHECKPOINTER_TTL_ENABLED`: a sweeper deletes stale threads with no active run and their checkpoints. |
+| Thread state materialization | Supported | Latest state materialized into `thread_state` (1:1) for search, with a values-hash skip on unchanged writes. `THREAD_STATE_MATERIALIZE=false` opts into pure checkpointer-centric (GET reads state from the checkpointer; `values` search unsupported). |
+| Encryption at rest | Supported | Set `LANGGRAPH_AES_KEY` to encrypt checkpoint state via langgraph's `EncryptedSerializer` (AES). |
 
 ### Authentication and authorization
 
@@ -84,8 +102,10 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 |:--|:--|:--|
 | Custom routes | Supported | Add FastAPI endpoints alongside the Agent Protocol API. |
 | Shared dependencies | Supported | Load Python modules available to all graphs. |
-| MCP server support | Coming soon | Expose agents as Model Context Protocol servers. |
-| A2A protocol | Coming soon | Agent-to-agent communication protocol support. |
+| MCP server support | Supported | `/mcp` Streamable HTTP endpoint exposes **each graph as its own tool** (tool name = graph id, input schema = the graph's input schema), matching the LangGraph Platform MCP model. Stateless per call, authenticated with the same auth backend as the REST API (tools run under the caller's identity). Toggle with `MCP_ENABLED` or `http.disable_mcp`. |
+| A2A protocol | Supported | `/a2a/{assistant_id}` exposes each assistant as an A2A agent (agent cards under `/.well-known`), built on the official `a2a-sdk` and authenticated with the same backend as REST. Toggle with `A2A_ENABLED`. |
+| Configurable headers | Supported | `http.configurable_headers` (includes/excludes) forwards allowlisted request headers into each run's `config.configurable`. |
+| WebSocket streaming | Supported | `/threads/{id}/stream/events` also serves the Agent Protocol v2 WebSocket transport used by the latest SDKs. |
 
 ### Observability
 
@@ -120,8 +140,6 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Feature | Status | Notes |
 |:--|:--|:--|
 | RemoteGraph | Not yet planned | Call remote graphs as local subgraphs. |
-| Encryption at rest | Not yet planned | Database-level encryption. Use Postgres TDE or volume encryption. |
-| Webhook callbacks | Not yet planned | Notify external services on run completion. |
 | Rate limiting | Not yet planned | Per-user or per-key request throttling. |
 | Multi-org workspaces | Not yet planned | Tenant isolation within a single deployment. |
 

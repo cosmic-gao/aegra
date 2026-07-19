@@ -1,12 +1,14 @@
 """FastAPI application for Aegra (Agent Protocol Server)"""
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any
 
 import structlog
 from asgi_correlation_id import CorrelationIdMiddleware
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute, APIRouter
@@ -34,11 +36,16 @@ from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
 from aegra_api.observability.setup import setup_observability
+from aegra_api.services.a2a_server import a2a_routes
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.cron_scheduler import cron_scheduler
+from aegra_api.services.delayed_run_scheduler import delayed_run_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
+from aegra_api.services.mcp_server import mcp as mcp_server
+from aegra_api.services.mcp_server import mcp_app
+from aegra_api.services.thread_ttl_sweeper import thread_ttl_sweeper
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
 
@@ -138,9 +145,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.start()
 
-    yield
+    # Start delayed-run scheduler (submits due after_seconds runs)
+    await delayed_run_scheduler.start()
 
-    # Shutdown order: cron → reaper → executor (drains jobs) → broker → Redis → DB
+    # Start thread TTL sweeper (no-op unless CHECKPOINTER_TTL_ENABLED)
+    await thread_ttl_sweeper.start()
+
+    # Run the MCP session manager for the mounted /mcp app (when enabled).
+    mcp_ctx = mcp_server.session_manager.run() if _mcp_enabled() else nullcontext()
+    async with mcp_ctx:
+        yield
+
+    # Shutdown order: ttl → delayed-run → cron → reaper → executor (drains) → broker → Redis → DB
+    await thread_ttl_sweeper.stop()
+    await delayed_run_scheduler.stop()
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.stop()
     if settings.redis.REDIS_BROKER_ENABLED:
@@ -168,6 +186,31 @@ async def agent_protocol_exception_handler(_request: Request, exc: HTTPException
     )
 
 
+async def validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Return request-validation errors in the Agent Protocol envelope.
+
+    FastAPI's default 422 body is ``{"detail": [...]}`` with a list detail; the
+    SDK only reads a string ``message`` and would fall back to a generic
+    "422 Unprocessable Entity". Flatten the first error into ``message`` and keep
+    the full list under ``details`` so all status codes share one envelope.
+    """
+    errors = exc.errors()
+    first = errors[0] if errors else None
+    if first is not None:
+        loc = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
+        message = f"{loc}: {first.get('msg')}" if loc else str(first.get("msg"))
+    else:
+        message = "Validation error"
+    return JSONResponse(
+        status_code=422,
+        content=AgentProtocolError(
+            error=get_error_type(422),
+            message=message,
+            details={"errors": jsonable_encoder(errors)},
+        ).model_dump(),
+    )
+
+
 async def general_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
     """Handle unexpected exceptions"""
     return JSONResponse(
@@ -181,6 +224,7 @@ async def general_exception_handler(_request: Request, exc: Exception) -> JSONRe
 
 
 exception_handlers = {
+    RequestValidationError: validation_exception_handler,
     HTTPException: agent_protocol_exception_handler,
     Exception: general_exception_handler,
 }
@@ -311,6 +355,26 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(crons_router)
     app.include_router(store_router)
     app.include_router(event_streaming_router)
+
+    if _mcp_enabled():
+        # Mount the MCP sub-app. Auth auto-application does not descend into a
+        # Mount, so the MCP app enforces its own access controls.
+        app.mount("/mcp", mcp_app)
+        logger.info("MCP server mounted at /mcp")
+
+    if settings.a2a.A2A_ENABLED:
+        # A2A routes live outside the authed routers and enforce auth per
+        # handler (same backend as REST), mirroring the MCP mount.
+        app.router.routes.extend(a2a_routes())
+        logger.info("A2A endpoints registered at /a2a")
+
+
+def _mcp_enabled() -> bool:
+    """MCP is on when MCP_ENABLED and not disabled via http config."""
+    if not settings.mcp.MCP_ENABLED:
+        return False
+    http_config = load_http_config()
+    return not (http_config and http_config.get("disable_mcp", False))
 
 
 def create_app() -> FastAPI:

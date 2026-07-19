@@ -201,7 +201,7 @@ class TestWaitForRunExceptionPaths:
 
     @pytest.mark.asyncio
     async def test_wait_for_run_failed_status(self) -> None:
-        """Test that failed runs return their output as-is."""
+        """Failed runs surface the SDK ``__error__`` envelope so wait() can raise."""
         thread_id = "test-thread-123"
         run_id = str(uuid4())
         user = User(identity="test-user", scopes=[])
@@ -244,7 +244,7 @@ class TestWaitForRunExceptionPaths:
             response = await wait_for_run(thread_id, request, user)
             result = await _consume_streaming_response(response)
 
-        assert result == {"error": "execution failed"}
+        assert result == {"__error__": {"error": "error", "message": "Graph execution error"}}
 
     @pytest.mark.asyncio
     async def test_wait_for_run_interrupted_status(self) -> None:

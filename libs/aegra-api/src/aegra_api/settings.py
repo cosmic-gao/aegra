@@ -369,6 +369,10 @@ class WorkerSettings(EnvBase):
     REAPER_INTERVAL_SECONDS: int = 15
     STUCK_PENDING_THRESHOLD_SECONDS: int = 120
     POSTGRES_POLL_INTERVAL_SECONDS: int = 5
+    # Delayed runs (after_seconds): how often to submit due runs, and the max
+    # submitted per tick.
+    DELAYED_RUN_POLL_INTERVAL_SECONDS: int = 5
+    DELAYED_RUN_BATCH_SIZE: int = 100
 
     @model_validator(mode="after")
     def _validate_lease_timing(self) -> "WorkerSettings":
@@ -441,6 +445,48 @@ class EventStreamingSettings(EnvBase):
     FF_V2_EVENT_STREAMING: bool = True
 
 
+class WebhookSettings(EnvBase):
+    """Outbound run-completion webhook delivery."""
+
+    WEBHOOK_ENABLED: bool = True
+    WEBHOOK_TIMEOUT_SECONDS: float = 30.0
+    WEBHOOK_MAX_ATTEMPTS: int = 3
+    WEBHOOK_BACKOFF_BASE_SECONDS: float = 1.0
+    # Empty disables signing. When set, requests carry a Standard-Webhooks-style
+    # HMAC-SHA256 ``Webhook-Signature`` header over the timestamp + body.
+    WEBHOOK_SIGNING_SECRET: str = ""
+    # SSRF guard: block webhook hosts that resolve to private/loopback/reserved
+    # IPs. Set true only for trusted internal webhook targets (self-hosted).
+    WEBHOOK_ALLOW_PRIVATE_IPS: bool = False
+
+
+class McpSettings(EnvBase):
+    """MCP server (/mcp) exposing assistants as tools."""
+
+    MCP_ENABLED: bool = True
+
+
+class A2ASettings(EnvBase):
+    """A2A protocol endpoints (/a2a/{assistant_id}) exposing assistants as agents."""
+
+    A2A_ENABLED: bool = True
+
+
+class CheckpointerSettings(EnvBase):
+    """Thread/checkpoint retention (TTL). Opt-in; deletes stale threads."""
+
+    # Off by default — enabling permanently deletes threads + their checkpoints.
+    CHECKPOINTER_TTL_ENABLED: bool = False
+    # Delete threads with no active run whose updated_at is older than this.
+    CHECKPOINTER_TTL_MINUTES: int = 43200  # 30 days
+    CHECKPOINTER_SWEEP_INTERVAL_MINUTES: int = 60
+    CHECKPOINTER_SWEEP_BATCH_SIZE: int = 100
+    # Materialize latest thread state into thread_state for search. Off = pure
+    # checkpointer-centric: GET thread reads state from the checkpointer and
+    # search's `values` filter is unsupported.
+    THREAD_STATE_MATERIALIZE: bool = True
+
+
 class Settings:
     """Container object that instantiates all application settings groups."""
 
@@ -454,6 +500,10 @@ class Settings:
         self.worker = WorkerSettings()
         self.cron = CronSettings()
         self.event_streaming = EventStreamingSettings()
+        self.webhook = WebhookSettings()
+        self.mcp = McpSettings()
+        self.a2a = A2ASettings()
+        self.checkpointer = CheckpointerSettings()
 
 
 settings = Settings()

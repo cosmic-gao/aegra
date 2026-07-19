@@ -39,6 +39,7 @@ from aegra_api.services.graph_factory import (
     invoke_factory,
     is_factory,
 )
+from aegra_api.utils.headers import current_configurable_headers
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 State = TypeVar("State")
@@ -624,6 +625,10 @@ class LangGraphService:
                 if key.startswith("aegra_graphs."):
                     sys.modules.pop(key, None)
         clear_factory_registry(graph_id)
+        # Keep the MCP tool-schema cache in sync with graph hot-reload.
+        from aegra_api.services.mcp_server import invalidate_schema_cache
+
+        invalidate_schema_cache(graph_id)
 
     def get_config(self) -> dict[str, Any] | None:
         """Get loaded configuration"""
@@ -716,6 +721,12 @@ def create_run_config(
 
     cfg: dict = deepcopy(additional_config) if additional_config else {}
     cfg.setdefault("configurable", {})
+
+    # Forward allowlisted request headers (http.configurable_headers) into the
+    # graph's configurable, but never let them shadow server-authoritative keys.
+    for header_key, header_value in current_configurable_headers().items():
+        if header_key not in ("thread_id", "run_id"):
+            cfg["configurable"].setdefault(header_key, header_value)
 
     # Server-authoritative — overwrite, never honor a client override.
     cfg["configurable"]["thread_id"] = thread_id

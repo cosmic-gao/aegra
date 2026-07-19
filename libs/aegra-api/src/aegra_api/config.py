@@ -22,6 +22,15 @@ class CorsConfig(TypedDict, total=False):
     max_age: int
 
 
+class ConfigurableHeadersConfig(TypedDict, total=False):
+    """Header allowlist for injecting request headers into run config."""
+
+    includes: list[str]
+    """fnmatch patterns for header names to forward into config['configurable']."""
+    excludes: list[str]
+    """fnmatch patterns that override includes (take precedence)."""
+
+
 class HttpConfig(TypedDict, total=False):
     """HTTP configuration options for custom routes"""
 
@@ -31,6 +40,10 @@ class HttpConfig(TypedDict, total=False):
     """Apply Aegra authentication dependency to custom routes (uses FastAPI dependencies, not middleware)"""
     cors: CorsConfig | None
     """Custom CORS configuration"""
+    disable_mcp: bool
+    """Disable the /mcp MCP server even when MCP_ENABLED"""
+    configurable_headers: ConfigurableHeadersConfig
+    """Request headers to forward into each run's config['configurable']"""
 
 
 class StoreIndexConfig(TypedDict, total=False):
@@ -59,11 +72,24 @@ class StoreIndexConfig(TypedDict, total=False):
     """
 
 
+class StoreTTLConfig(TypedDict, total=False):
+    """TTL configuration for store items. All durations are in minutes."""
+
+    refresh_on_read: bool
+    """Reset an item's expiry on get/search (default True in langgraph)."""
+    default_ttl: float
+    """Lifespan of a new item after last access, in minutes. None = no expiry."""
+    sweep_interval_minutes: int
+    """How often the store deletes expired items. Omit to disable sweeping."""
+
+
 class StoreConfig(TypedDict, total=False):
     """Store configuration options"""
 
     index: StoreIndexConfig | None
     """Vector index configuration for semantic search"""
+    ttl: StoreTTLConfig | None
+    """Item time-to-live and background sweeping"""
 
 
 class AuthConfig(TypedDict, total=False):

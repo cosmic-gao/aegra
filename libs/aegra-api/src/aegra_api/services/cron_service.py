@@ -4,9 +4,9 @@ Handles CRUD operations on cron records and delegates run creation
 to the existing run preparation pipeline.
 """
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
-from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,6 +30,7 @@ from aegra_api.models.crons import (
 from aegra_api.services.langgraph_service import LangGraphService, get_langgraph_service
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
+from aegra_api.utils.url import redact_url
 
 logger = structlog.getLogger(__name__)
 
@@ -53,6 +54,9 @@ def _build_payload(request: CronCreate | CronUpdate) -> dict[str, Any]:
         "stream_mode",
         "stream_subgraphs",
         "timezone",
+        "command",
+        "durability",
+        "after_seconds",
     ):
         value = getattr(request, field, None)
         if value is not None:
@@ -123,34 +127,26 @@ def _compute_next_run(
     return result.astimezone(UTC)
 
 
-def _mask_webhook_credentials(url: str) -> str:
-    """Strip userinfo from a webhook URL before surfacing it back to clients.
-
-    Webhooks like ``https://user:token@host/path`` leak the credential on
-    every read of the cron. We retain the host/path so callers can still
-    audit destination, but the secret never round-trips.
-    """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return url
-    if not parsed.hostname:
-        return url
-    netloc = parsed.hostname
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    return urlunparse(parsed._replace(netloc=netloc))
-
-
 def _redact_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a copy of *payload* with webhook credentials masked."""
+    """Return a copy of *payload* with webhook credentials masked.
+
+    A webhook like ``https://user:token@host/path`` would otherwise leak its
+    credential on every read of the cron.
+    """
     if not payload:
         return {}
     masked = dict(payload)
     webhook = masked.get("webhook")
     if isinstance(webhook, str) and webhook:
-        masked["webhook"] = _mask_webhook_credentials(webhook)
+        masked["webhook"] = redact_url(webhook)
     return masked
+
+
+def _serialize_cron(response: CronResponse, select_fields: Sequence[str] | None) -> dict[str, Any]:
+    """Dump a cron for the wire, projected to `select_fields` when given."""
+    if select_fields:
+        return response.model_dump(mode="json", include=set(select_fields))
+    return response.model_dump(mode="json")
 
 
 def _cron_to_response(row: CronORM) -> CronResponse:
@@ -162,6 +158,7 @@ def _cron_to_response(row: CronORM) -> CronResponse:
         on_run_completed=cast(OnRunCompleted | None, row.on_run_completed),
         end_time=row.end_time,
         schedule=row.schedule,
+        timezone=(row.payload or {}).get("timezone"),
         created_at=row.created_at,
         updated_at=row.updated_at,
         payload=_redact_payload(row.payload),
@@ -207,11 +204,7 @@ class CronService:
         *,
         thread_id: str | None = None,
     ) -> CronORM:
-        """Create a new cron job record.
-
-        Returns the ORM row so the caller (API layer) can also trigger
-        the first run and return the ``Run`` response.
-        """
+        """Create a new cron job record; the scheduler owns all firing."""
         # Schedule: validate format AND seconds-feature gate.
         if _is_seconds_cron(request.schedule) and not settings.cron.CRON_ALLOW_SECONDS_SCHEDULE:
             raise HTTPException(
@@ -262,18 +255,7 @@ class CronService:
 
         payload = _build_payload(request)
         now = datetime.now(UTC)
-        # Advance past the immediate first occurrence since _trigger_first_run
-        # fires a run right away when ``enabled`` is not False. We skip to the
-        # second occurrence so the scheduler does not fire a duplicate run
-        # seconds after creation. When the caller suppresses the first run
-        # (enabled=False) the scheduler picks up the regular first occurrence.
-        first_occ = _compute_next_run(request.schedule, now=now, timezone=request.timezone)
-        will_fire_immediately = request.enabled is not False
-        next_run = (
-            _compute_next_run(request.schedule, now=first_occ, timezone=request.timezone)
-            if will_fire_immediately
-            else first_occ
-        )
+        next_run = _compute_next_run(request.schedule, now=now, timezone=request.timezone)
 
         cron_orm = CronORM(
             cron_id=str(uuid4()),
@@ -386,8 +368,8 @@ class CronService:
         self,
         request: CronSearchRequest,
         user_identity: str,
-    ) -> list[CronResponse]:
-        """Search cron jobs with filters, pagination, and sorting."""
+    ) -> list[dict[str, Any]]:
+        """Search cron jobs with filters, pagination, sorting, and field selection."""
         stmt = select(CronORM).where(CronORM.user_id == user_identity)
 
         if request.assistant_id is not None:
@@ -397,14 +379,12 @@ class CronService:
             stmt = stmt.where(CronORM.thread_id == request.thread_id)
         if request.enabled is not None:
             stmt = stmt.where(CronORM.enabled == request.enabled)
+        if request.metadata:
+            stmt = stmt.where(CronORM.metadata_dict.op("@>")(request.metadata))
 
-        # Sorting
-        sort_column = CronORM.created_at
-        if request.sort_by == "next_run_date":
-            sort_column = CronORM.next_run_date
-        elif request.sort_by == "updated_at":
-            sort_column = CronORM.updated_at
-
+        # sort_by is Pydantic-validated against a Literal of CronORM columns,
+        # so getattr cannot reach arbitrary attributes.
+        sort_column = getattr(CronORM, request.sort_by) if request.sort_by else CronORM.created_at
         if request.sort_order == "desc":
             stmt = stmt.order_by(sort_column.desc())
         else:
@@ -413,7 +393,7 @@ class CronService:
         stmt = stmt.offset(request.offset).limit(request.limit)
 
         result = await self.session.scalars(stmt)
-        return [_cron_to_response(row) for row in result.all()]
+        return [_serialize_cron(_cron_to_response(row), request.select) for row in result.all()]
 
     async def count_crons(
         self,
@@ -428,6 +408,8 @@ class CronService:
             stmt = stmt.where(CronORM.assistant_id == resolved_assistant_id)
         if request.thread_id is not None:
             stmt = stmt.where(CronORM.thread_id == request.thread_id)
+        if request.metadata:
+            stmt = stmt.where(CronORM.metadata_dict.op("@>")(request.metadata))
 
         total = await self.session.scalar(stmt)
         return total or 0

@@ -87,6 +87,21 @@ class LangGraphSerializer(Serializer):
 
         return tasks
 
+    def build_interrupts_map(self, snapshot: Any) -> dict[str, list[Any]]:
+        """Group a snapshot's interrupts by the task id that raised them.
+
+        Matches the SDK ``Thread.interrupts`` shape (``dict[str, list[Interrupt]]``).
+        Tasks without interrupts or without an id are skipped.
+        """
+        result: dict[str, list[Any]] = {}
+        for task in getattr(snapshot, "tasks", None) or ():
+            task_interrupts = getattr(task, "interrupts", None)
+            task_id = getattr(task, "id", None)
+            if not task_interrupts or task_id is None:
+                continue
+            result[str(task_id)] = self.serialize(list(task_interrupts))
+        return result
+
     def extract_interrupts_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
         """Extract and serialize interrupts from a snapshot"""
         interrupts = []

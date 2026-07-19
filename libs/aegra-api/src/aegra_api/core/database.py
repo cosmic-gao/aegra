@@ -1,13 +1,18 @@
 """Database manager with LangGraph integration"""
 
+from typing import cast
+
 import structlog
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.base import TTLConfig
 from langgraph.store.postgres.aio import AsyncPostgresStore
-from psycopg.rows import dict_row
+from langgraph.store.postgres.base import PostgresIndexConfig
+from psycopg import AsyncConnection
+from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from aegra_api.config import load_store_config
+from aegra_api.core.checkpointer import AegraPostgresSaver, build_encrypted_serde
 from aegra_api.settings import settings
 
 logger = structlog.get_logger(__name__)
@@ -19,9 +24,11 @@ class DatabaseManager:
     def __init__(self) -> None:
         self.engine: AsyncEngine | None = None
 
-        # Shared pool for LangGraph components (Checkpointer + Store)
-        self.lg_pool: AsyncConnectionPool | None = None
-        self._checkpointer: AsyncPostgresSaver | None = None
+        # Shared pool for LangGraph components (Checkpointer + Store). Typed as
+        # DictRow because the pool is opened with row_factory=dict_row below,
+        # which is what the langgraph savers/stores require.
+        self.lg_pool: AsyncConnectionPool[AsyncConnection[DictRow]] | None = None
+        self._checkpointer: AegraPostgresSaver | None = None
         self._store: AsyncPostgresStore | None = None
         self._database_url = settings.db.database_url
 
@@ -52,13 +59,16 @@ class DatabaseManager:
 
         # Create a single shared pool.
         # 'open=False' is important to avoid RuntimeWarning; we open it explicitly below.
-        self.lg_pool = AsyncConnectionPool(
-            conninfo=settings.db.database_url_sync,
-            min_size=settings.pool.LANGGRAPH_MIN_POOL_SIZE,
-            max_size=lg_max,
-            open=False,
-            kwargs=lg_kwargs,
-            check=AsyncConnectionPool.check_connection,
+        self.lg_pool = cast(
+            "AsyncConnectionPool[AsyncConnection[DictRow]]",
+            AsyncConnectionPool(
+                conninfo=settings.db.database_url_sync,
+                min_size=settings.pool.LANGGRAPH_MIN_POOL_SIZE,
+                max_size=lg_max,
+                open=False,
+                kwargs=lg_kwargs,
+                check=AsyncConnectionPool.check_connection,
+            ),
         )
 
         # Explicitly open the pool
@@ -69,24 +79,39 @@ class DatabaseManager:
 
         logger.info(f"Initializing LangGraph components with shared pool (max {lg_max} conns)...")
 
-        self._checkpointer = AsyncPostgresSaver(conn=self.lg_pool)
+        # Encrypt checkpoint state at rest when LANGGRAPH_AES_KEY is configured.
+        self._checkpointer = AegraPostgresSaver(conn=self.lg_pool, serde=build_encrypted_serde())
         await self._checkpointer.setup()  # Ensure tables exist
 
-        # Load store configuration for semantic search (if configured)
+        # Load store configuration for semantic search + TTL (if configured).
+        # Aegra's config TypedDicts mirror langgraph's shape; cast at the boundary.
         store_config = load_store_config()
-        index_config = store_config.get("index") if store_config else None
+        index_config = cast(PostgresIndexConfig | None, store_config.get("index") if store_config else None)
+        ttl_config = cast(TTLConfig | None, store_config.get("ttl") if store_config else None)
 
-        self._store = AsyncPostgresStore(conn=self.lg_pool, index=index_config)
+        self._store = AsyncPostgresStore(conn=self.lg_pool, index=index_config, ttl=ttl_config)
         await self._store.setup()  # Ensure tables exist
 
         if index_config:
             embed_model = index_config.get("embed", "unknown")
             logger.info(f"Semantic store enabled with embeddings: {embed_model}")
+        if ttl_config:
+            # No-ops when ttl_config has no sweep interval; starts the background
+            # sweeper otherwise.
+            await self._store.start_ttl_sweeper()
+            logger.info(f"Store TTL enabled: {ttl_config}")
 
         logger.info("✅ Database and LangGraph components initialized")
 
     async def close(self) -> None:
         """Close database connections"""
+        # Stop the store TTL sweeper before tearing down the pool it uses.
+        if self._store is not None:
+            try:
+                await self._store.stop_ttl_sweeper()
+            except Exception as exc:
+                logger.warning("Failed to stop store TTL sweeper", error=str(exc))
+
         # Close SQLAlchemy engine
         if self.engine:
             await self.engine.dispose()
@@ -101,8 +126,8 @@ class DatabaseManager:
 
         logger.info("✅ Database connections closed")
 
-    def get_checkpointer(self) -> AsyncPostgresSaver:
-        """Return the live AsyncPostgresSaver instance."""
+    def get_checkpointer(self) -> AegraPostgresSaver:
+        """Return the live checkpointer instance."""
         if self._checkpointer is None:
             raise RuntimeError("Database not initialized")
         return self._checkpointer

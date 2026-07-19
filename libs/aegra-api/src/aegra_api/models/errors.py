@@ -10,7 +10,7 @@ class AgentProtocolError(BaseModel):
 
     error: str = Field(..., description="Error type")
     message: str = Field(..., description="Human-readable error message")
-    details: dict[str, Any] | None = Field(None, description="Additional error details")
+    details: dict[str, Any] | None = Field(default=None, description="Additional error details")
 
 
 # Reusable OpenAPI error response declarations for endpoint decorators

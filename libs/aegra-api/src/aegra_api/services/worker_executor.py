@@ -21,6 +21,8 @@ from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.orm import Run as RunORM
@@ -242,6 +244,8 @@ class WorkerExecutor(BaseExecutor):
         finally:
             active_runs.pop(run_id, None)
             semaphore.release()
+            # Wake a worker to pick up any enqueued successor on the freed thread.
+            await _wake_thread_successor(run_id)
 
     # ------------------------------------------------------------------
     # Job execution (lease + heartbeat)
@@ -339,6 +343,36 @@ async def _get_thread_id_for_run(run_id: str) -> str | None:
         return await session.scalar(select(RunORM.thread_id).where(RunORM.run_id == run_id))
 
 
+async def _wake_thread_successor(done_run_id: str) -> None:
+    """Re-enqueue the oldest pending run on the just-finished run's thread.
+
+    A run deferred by the per-thread claim gate left no sentinel in the queue;
+    this nudges a worker to claim the successor as soon as the predecessor
+    frees the thread (multitask enqueue), instead of waiting for the idle tick.
+    Best-effort: on any failure the idle tick / Postgres poll still recovers it.
+    """
+    try:
+        maker = _get_session_maker()
+        thread_subq = select(RunORM.thread_id).where(RunORM.run_id == done_run_id).scalar_subquery()
+        async with maker() as session:
+            successor = await session.scalar(
+                select(RunORM.run_id)
+                .where(
+                    RunORM.thread_id == thread_subq,
+                    RunORM.status == "pending",
+                    RunORM.claimed_by.is_(None),
+                )
+                .order_by(RunORM.created_at.asc())
+                .limit(1)
+            )
+        if successor is None:
+            return
+        client = redis_manager.get_client()
+        await client.rpush(settings.worker.WORKER_QUEUE_KEY, successor)  # type: ignore[arg-type]
+    except Exception as exc:
+        logger.debug("Successor wakeup failed; idle tick will recover", run_id=done_run_id, error=str(exc))
+
+
 # ------------------------------------------------------------------
 # Lease operations (module-level for reuse by LeaseReaper)
 # ------------------------------------------------------------------
@@ -354,54 +388,69 @@ class _LoadedRun:
         self.trace = trace
 
 
-async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
-    """Acquire lease and load job in a single DB session.
+# Correlated "is another run already running on this thread?" check.
+_RunBusy = aliased(RunORM)
+_thread_has_running_run = (
+    select(_RunBusy.run_id).where(_RunBusy.thread_id == RunORM.thread_id, _RunBusy.status == "running").exists()
+)
 
-    Combines the lease UPDATE + job SELECT into one session. If the row
-    is missing execution_params (data corruption / pre-migration row),
-    releases the claim and marks the run as errored.
+
+async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
+    """Claim a pending run and load its job, enforcing per-thread serialization.
+
+    The claim only succeeds when no other run on the same thread is already
+    running (multitask enqueue). A concurrent claim that slips past that check
+    is caught by the ``uq_runs_one_running_per_thread`` unique index →
+    IntegrityError → treated as "not claimed". Missing execution_params
+    (corruption / pre-migration row) releases the claim and errors the run.
     """
     lease_until = datetime.now(UTC) + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
     maker = _get_session_maker()
-    async with maker() as session:
-        result = await session.execute(
-            update(RunORM)
-            .where(
-                RunORM.run_id == run_id,
-                RunORM.status == "pending",
-                RunORM.claimed_by.is_(None),
-            )
-            .values(claimed_by=worker_name, lease_expires_at=lease_until, status="running")
-        )
-        if result.rowcount == 0:  # type: ignore[union-attr]
-            await session.rollback()
-            return None
-
-        run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-        await session.commit()
-
-        if run_orm is None or run_orm.execution_params is None:
-            logger.warning(
-                "Run not found or missing execution_params after lease, releasing claim",
-                run_id=run_id,
-                worker=worker_name,
-            )
-            await session.execute(
+    try:
+        async with maker() as session:
+            result = await session.execute(
                 update(RunORM)
-                .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
-                .values(
-                    claimed_by=None,
-                    lease_expires_at=None,
-                    status="error",
-                    error_message="Run missing execution_params (data corruption or pre-migration row)",
+                .where(
+                    RunORM.run_id == run_id,
+                    RunORM.status == "pending",
+                    RunORM.claimed_by.is_(None),
+                    ~_thread_has_running_run,
                 )
+                .values(claimed_by=worker_name, lease_expires_at=lease_until, status="running")
             )
-            await session.commit()
-            return None
+            if result.rowcount == 0:  # type: ignore[union-attr]
+                await session.rollback()
+                return None
 
-        job = RunJob.from_run_orm(run_orm)
-        trace = run_orm.execution_params.get("trace", {})
-        return _LoadedRun(job=job, trace=trace)
+            run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
+            await session.commit()
+
+            if run_orm is None or run_orm.execution_params is None:
+                logger.warning(
+                    "Run not found or missing execution_params after lease, releasing claim",
+                    run_id=run_id,
+                    worker=worker_name,
+                )
+                await session.execute(
+                    update(RunORM)
+                    .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+                    .values(
+                        claimed_by=None,
+                        lease_expires_at=None,
+                        status="error",
+                        error_message="Run missing execution_params (data corruption or pre-migration row)",
+                    )
+                )
+                await session.commit()
+                return None
+
+            job = RunJob.from_run_orm(run_orm)
+            trace = run_orm.execution_params.get("trace", {})
+            return _LoadedRun(job=job, trace=trace)
+    except IntegrityError:
+        # Lost the one-running-per-thread race; run stays pending and is
+        # re-enqueued when the winning run finishes (see _wake_thread_successor).
+        return None
 
 
 async def _release_lease(run_id: str, worker_name: str) -> None:

@@ -8,6 +8,7 @@ from uvicorn._types import HTTPScope
 from uvicorn.protocols.utils import get_path_with_query_string
 
 from aegra_api.settings import settings
+from aegra_api.utils.headers import set_request_configurable_headers
 
 app_logger = structlog.stdlib.get_logger("app.app_logs")
 access_logger = structlog.stdlib.get_logger("app.access_logs")
@@ -31,6 +32,9 @@ class StructLogMiddleware:
         http_scope = cast(HTTPScope, scope)
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=correlation_id.get())
+        # Capture allowlisted headers for this request so run creation can
+        # forward them into config['configurable'] (http.configurable_headers).
+        set_request_configurable_headers(http_scope.get("headers", []))
 
         info = AccessInfo()
 

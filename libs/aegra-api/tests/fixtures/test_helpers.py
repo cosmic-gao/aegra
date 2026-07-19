@@ -84,15 +84,20 @@ class DummyRun:
         metadata: dict[str, Any] | None = None,
         input_data: dict[str, Any] | None = None,
         output_data: dict[str, Any] | None = None,
+        multitask_strategy: str = "reject",
     ):
         self.run_id = run_id
         self.thread_id = thread_id
         self.assistant_id = assistant_id
         self.status = status
         self.user_id = user_id
+        # ORM name-maps the "metadata" column to the ``metadata_dict`` attribute.
+        self.metadata_dict = metadata or {}
         self.metadata = metadata or {}
+        self.multitask_strategy = multitask_strategy
         self.input = input_data or {"message": "test"}
         self.output = output_data
+        self.error_message = None
         self.created_at = datetime.now(UTC)
         self.updated_at = datetime.now(UTC)
 
@@ -116,9 +121,19 @@ class DummyThread:
 
 
 class DummyStoreItem:
-    """Mock store item for testing"""
+    """Mock store item for testing, mirroring langgraph's Item/SearchItem."""
 
-    def __init__(self, key: str, value: Any, namespace: tuple):
+    def __init__(
+        self,
+        key: str,
+        value: Any,
+        namespace: tuple,
+        *,
+        score: float | None = None,
+    ):
         self.key = key
         self.value = value
         self.namespace = namespace
+        self.created_at = datetime.now(UTC)
+        self.updated_at = datetime.now(UTC)
+        self.score = score

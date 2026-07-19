@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Mapping
 from uuid import uuid4
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
@@ -22,7 +22,7 @@ from aegra_api.api.runs import (
     wait_for_run,
 )
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
-from aegra_api.core.orm import get_session
+from aegra_api.core.orm import get_session, get_session_maker
 from aegra_api.core.sse import make_sse_response
 from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
@@ -135,6 +135,7 @@ async def stateless_wait_for_run(
     (unless ``on_completion="keep"``).
     """
     thread_id = str(uuid4())
+    request.if_not_exists = "create"  # ephemeral thread is created by this run
     should_delete = request.on_completion != "keep"
 
     try:
@@ -203,6 +204,7 @@ async def stateless_stream_run(
     stream finishes (unless ``on_completion="keep"``).
     """
     thread_id = str(uuid4())
+    request.if_not_exists = "create"  # ephemeral thread is created by this run
     should_delete = request.on_completion != "keep"
 
     try:
@@ -285,6 +287,7 @@ async def stateless_create_run(
     ``on_completion="keep"``).
     """
     thread_id = str(uuid4())
+    request.if_not_exists = "create"  # ephemeral thread is created by this run
     should_delete = request.on_completion != "keep"
 
     try:
@@ -306,3 +309,35 @@ async def stateless_create_run(
         schedule_background_cleanup(result.run_id, thread_id, user.identity)
 
     return result
+
+
+# Bound batch fan-out so one request can't create unbounded runs or open
+# unbounded DB sessions at once.
+_MAX_BATCH_SIZE = 100
+_BATCH_CONCURRENCY = 10
+
+
+@router.post("/runs/batch", response_model=list[Run], responses={**NOT_FOUND, **CONFLICT})
+async def stateless_create_run_batch(
+    requests: list[RunCreate],
+    user: User = Depends(get_current_user),
+) -> list[Run]:
+    """Create a batch of stateless background runs.
+
+    Each run gets its own ephemeral thread and runs in the background. Bounded
+    concurrency; returns the created Run records in request order. Each item
+    uses its own DB session — a single AsyncSession is not concurrency-safe.
+    """
+    if not requests:
+        return []
+    if len(requests) > _MAX_BATCH_SIZE:
+        raise HTTPException(status_code=422, detail=f"batch exceeds {_MAX_BATCH_SIZE} runs")
+
+    maker = get_session_maker()
+    semaphore = asyncio.Semaphore(_BATCH_CONCURRENCY)
+
+    async def _create_one(req: RunCreate) -> Run:
+        async with semaphore, maker() as batch_session:
+            return await stateless_create_run(req, user, batch_session)
+
+    return list(await asyncio.gather(*(_create_one(req) for req in requests)))

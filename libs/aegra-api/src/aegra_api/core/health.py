@@ -45,7 +45,15 @@ async def info(_request: Request) -> InfoResponse:
         version=__version__,
         description="Production-ready Agent Protocol server built on LangGraph",
         status="running",
-        flags={"assistants": True, "crons": settings.cron.CRON_ENABLED},
+        flags={
+            "assistants": True,
+            "crons": settings.cron.CRON_ENABLED,
+            "webhooks": settings.webhook.WEBHOOK_ENABLED,
+            "multitask": True,
+            "batch": True,
+            "store": True,
+            "checkpointer": True,
+        },
     )
 
 

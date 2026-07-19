@@ -3,22 +3,28 @@
 import asyncio
 import contextlib
 import json
-import warnings
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
+from aegra_api.core.orm import ThreadState as ThreadStateORM
 from aegra_api.core.orm import get_session
+from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.core.serializers.langgraph import LangGraphSerializer
 from aegra_api.models import (
     Thread,
     ThreadCheckpoint,
@@ -34,8 +40,12 @@ from aegra_api.models import (
     User,
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND
+from aegra_api.models.threads import ThreadPruneRequest
+from aegra_api.services.run_cleanup import delete_thread_by_id
+from aegra_api.services.run_status import materialize_thread_state
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
+from aegra_api.utils.extract import extract_path_value, validate_extract
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
@@ -46,7 +56,6 @@ thread_state_service = ThreadStateService()
 
 # --- Sort resolution for /threads/search ---
 
-_ALLOWED_SORT_FIELDS: frozenset[str] = frozenset({"created_at", "updated_at", "thread_id", "status"})
 _DEFAULT_SORT_FIELD = "created_at"
 _DEFAULT_SORT_ASC = False
 
@@ -54,36 +63,27 @@ _DEFAULT_SORT_ASC = False
 def _resolve_sort(request: ThreadSearchRequest) -> tuple[Any, bool]:
     """Resolve (ORM column, is_ascending) for /threads/search.
 
-    Precedence: SDK-style ``sort_by`` (Pydantic-validated against the column
-    Literal) wins over the legacy ``order_by`` string. ``order_by`` stays
-    permissive — unknown columns or malformed input silently fall back to the
-    default (``created_at DESC``) — to preserve backward compatibility.
+    ``sort_by`` is Pydantic-validated against the column Literal;
+    ``state_updated_at`` maps to updated_at (values materialize on finalize,
+    which touches updated_at in the same transaction).
     """
     if request.sort_by:
-        column = getattr(ThreadORM, request.sort_by)
+        field = "updated_at" if request.sort_by == "state_updated_at" else request.sort_by
         asc = (request.sort_order or "desc").lower() == "asc"
-        return column, asc
-
-    # order_by is marked deprecated on the Pydantic Field for OpenAPI; the
-    # access-site warning is meant for callers, not for the handler honouring
-    # the field — suppress it here.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        legacy = request.order_by
-
-    if legacy:
-        parts = legacy.strip().split()
-        if parts and parts[0].lower() in _ALLOWED_SORT_FIELDS:
-            asc = len(parts) > 1 and parts[1].lower() == "asc"
-            return getattr(ThreadORM, parts[0].lower()), asc
-
+        return getattr(ThreadORM, field), asc
     return getattr(ThreadORM, _DEFAULT_SORT_FIELD), _DEFAULT_SORT_ASC
 
 
 # --- Helper for safe ORM -> Pydantic conversion (Test/Mock compatible) ---
 
 
-def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | None = None) -> Thread:
+def _serialize_thread(
+    thread_orm: ThreadORM,
+    default_metadata: dict[str, Any] | None = None,
+    *,
+    include_ttl: bool = False,
+    state: ThreadStateORM | None = None,
+) -> Thread:
     """
     Safely converts ThreadORM to Thread model using dictionary construction.
     This handles None values and MagicMocks that appear in tests, preventing
@@ -106,7 +106,7 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
         # Try to convert dict-like objects (mocks)
         with contextlib.suppress(Exception):
             if hasattr(val, "items"):
-                return dict(val.items())  # type: ignore[attr-defined]
+                return dict(val.items())
         return default
 
     # 1. ID
@@ -134,17 +134,86 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
     if not isinstance(u_at, datetime):
         u_at = datetime.now(UTC)
 
+    # Latest state lives in thread_state (1:1); present only when the caller joined it.
+    values = getattr(state, "values", None) if state is not None else None
+    interrupts = getattr(state, "interrupts", None) if state is not None else None
+    ttl = getattr(thread_orm, "ttl", None) if include_ttl else None
+
     # Validate from dict (more robust than validate(orm_obj) for partial mocks)
     return Thread.model_validate(
         {
             "thread_id": t_id,
             "status": status,
             "metadata": metadata,
+            "values": values if isinstance(values, dict) else None,
+            "interrupts": interrupts if isinstance(interrupts, dict) else None,
+            "ttl": ttl if isinstance(ttl, dict) else None,
             "user_id": u_id,
             "created_at": c_at,
             "updated_at": u_at,
         }
     )
+
+
+async def _apply_supersteps(
+    session: AsyncSession,
+    thread: ThreadORM,
+    supersteps: list[dict[str, Any]],
+    user: User,
+) -> None:
+    """Seed a new thread by applying superstep state updates in order.
+
+    Each superstep item is ``{"updates": [{"values", "as_node"?}]}`` (SDK
+    shape). Requires the thread to carry a ``graph_id`` so state updates can
+    resolve the graph's channels.
+    """
+    graph_id = (thread.metadata_json or {}).get("graph_id")
+    if not graph_id:
+        raise HTTPException(422, "supersteps require a graph_id on the thread")
+
+    from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
+
+    service = get_langgraph_service()
+    raw_config = create_thread_config(thread.thread_id, user)
+    config = cast("RunnableConfig", raw_config)
+    async with service.get_graph(graph_id, config=raw_config, access_context="threads.update", user=user) as agent:
+        agent = agent.with_config(config)
+        for step in supersteps:
+            updates = step.get("updates") or []
+            for item in updates:
+                if item.get("command") is not None:
+                    raise HTTPException(422, "supersteps with 'command' are not supported")
+                await agent.aupdate_state(config, item.get("values"), as_node=item.get("as_node"))
+    await _materialize_thread_state(session, thread, user)
+
+
+async def _materialize_thread_state(session: AsyncSession, thread: ThreadORM, user: User) -> None:
+    """Best-effort refresh of the thread row's materialized values/interrupts.
+
+    Feeds thread search's ``values`` filter and ``select``. A read failure must
+    not fail the state update that triggered it, so errors are swallowed.
+    """
+    graph_id = (thread.metadata_json or {}).get("graph_id")
+    if not graph_id:
+        return
+    from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
+
+    serializer = GeneralSerializer()
+    service = get_langgraph_service()
+    raw_config = create_thread_config(thread.thread_id, user)
+    config = cast("RunnableConfig", raw_config)
+    try:
+        async with service.get_graph(graph_id, config=raw_config, access_context="threads.read", user=user) as agent:
+            state = await agent.aget_state(config)
+        values = serializer.serialize(state.values) if state.values is not None else None
+        interrupts = LangGraphSerializer().build_interrupts_map(state)
+    except Exception as exc:
+        logger.warning("Could not materialize thread state", thread_id=thread.thread_id, error=str(exc))
+        return
+    if isinstance(values, dict):
+        await materialize_thread_state(session, thread.thread_id, values, interrupts)
+    thread.updated_at = datetime.now(UTC)
+    await session.commit()
 
 
 # --- Endpoints ---
@@ -199,18 +268,22 @@ async def create_thread(
     metadata["owner"] = user.identity
     # Preserve client-provided values; only set defaults if missing.
     metadata.setdefault("assistant_id", None)
-    metadata.setdefault("graph_id", None)
+    metadata.setdefault("graph_id", request.graph_id)
     metadata.setdefault("thread_name", "")
 
     thread_orm = ThreadORM(
         thread_id=thread_id,
         status="idle",
         metadata_json=metadata,
+        ttl=request.ttl,
         user_id=user.identity,
     )
 
     session.add(thread_orm)
     await session.commit()
+
+    if request.supersteps:
+        await _apply_supersteps(session, thread_orm, request.supersteps, user)
 
     with contextlib.suppress(Exception):
         await session.refresh(thread_orm)
@@ -251,6 +324,7 @@ async def list_threads(
 @router.get("/threads/{thread_id}", response_model=Thread, responses={**NOT_FOUND})
 async def get_thread(
     thread_id: str,
+    include: list[str] | None = Query(None, description="Extra fields to include; supports 'ttl'."),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> Thread:
@@ -269,7 +343,11 @@ async def get_thread(
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    return _serialize_thread(thread)
+    # The SDK sends include as a comma-joined single param.
+    include_parts = {p for raw in include or [] for p in raw.split(",") if p}
+    # Latest values/interrupts live in thread_state (1:1); fetch for the detail view.
+    state = await session.scalar(select(ThreadStateORM).where(ThreadStateORM.thread_id == thread_id))
+    return _serialize_thread(thread, include_ttl="ttl" in include_parts, state=state)
 
 
 @router.patch("/threads/{thread_id}", response_model=Thread, responses={**NOT_FOUND})
@@ -310,11 +388,14 @@ async def update_thread(
         current_metadata = dict(thread.metadata_json or {})
         current_metadata.update(request.metadata)
         thread.metadata_json = current_metadata
+    if isinstance(request.ttl, dict):
+        # The Pydantic validator normalizes int minutes to the config dict.
+        thread.ttl = request.ttl
 
     await session.commit()
     await session.refresh(thread)
 
-    return _serialize_thread(thread)
+    return _serialize_thread(thread, include_ttl=request.ttl is not None)
 
 
 @router.get("/threads/{thread_id}/state", response_model=ThreadState, responses={**NOT_FOUND})
@@ -503,15 +584,9 @@ async def update_thread_state(
                     else:
                         update_values = update_values[0] if update_values else None
 
-                # Update the state using aupdate_state
-                # aupdate_state signature: aupdate_state(config, values, as_node=None)
-                # When as_node is not specified, the graph may try to continue execution,
-                # which can fail if the state doesn't match expected graph flow.
-                # We should always use as_node to prevent unwanted execution.
+                # Always pass as_node: without it the graph may resume execution
+                # instead of only updating state, which can fail if state doesn't match graph flow.
                 try:
-                    # If as_node is not provided, we need to determine a safe node to use
-                    # For state updates without as_node, we'll use None which should just update state
-                    # without triggering execution, but the graph may still validate the state
                     updated_config = await agent.aupdate_state(config, update_values, as_node=request.as_node)
                 except Exception as update_error:
                     logger.exception(
@@ -547,6 +622,7 @@ async def update_thread_state(
                     checkpoint_info.get("checkpoint_id"),
                 )
 
+                await _materialize_thread_state(session, thread, user)
                 return ThreadStateUpdateResponse(checkpoint=checkpoint_info)
 
         except HTTPException:
@@ -854,16 +930,45 @@ async def delete_thread(
     return {"status": "deleted"}
 
 
-@router.post("/threads/search", response_model=list[Thread])
+def _wants_state(request: ThreadSearchRequest) -> bool:
+    """Whether the search needs thread_state joined (values filter / projection)."""
+    if request.values or request.extract:
+        return True
+    return bool(request.select) and bool({"values", "interrupts"} & set(request.select))
+
+
+def _search_filters(request: ThreadSearchRequest, user: User) -> list[Any]:
+    """Shared WHERE predicates for /threads/search and /threads/count.
+
+    The ``values`` filter targets ``thread_state`` (the caller joins it when
+    ``_wants_state`` is true).
+    """
+    where: list[Any] = [ThreadORM.user_id == user.identity]
+    if request.status:
+        where.append(ThreadORM.status == request.status)
+    if request.metadata:
+        # JSONB containment: type-correct, deep-nested, GIN-indexable. Mirrors
+        # AssistantService.search_assistants for cross-endpoint consistency.
+        where.append(ThreadORM.metadata_json.op("@>")(request.metadata))
+    if request.values:
+        where.append(ThreadStateORM.values.op("@>")(request.values))
+    if request.ids:
+        where.append(ThreadORM.thread_id.in_(request.ids))
+    return where
+
+
+# response_model=None: with `select`/`extract` items become partial dicts.
+@router.post("/threads/search", response_model=None)
 async def search_threads(
     request: ThreadSearchRequest,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
-) -> list[Thread]:
+) -> list[Thread] | list[dict[str, Any]]:
     """Search threads with filters.
 
-    Filter by status or metadata key-value pairs. Results are paginated via
-    `limit` and `offset` and ordered by creation time (newest first).
+    Filter by status, metadata, latest state values, or explicit ids. Results
+    are paginated via `limit`/`offset`; `select` projects fields and `extract`
+    adds keys pulled from values/metadata via dot/bracket paths.
     """
     # Authorization check
     ctx = build_auth_context(user, "threads", "search")
@@ -879,16 +984,19 @@ async def search_threads(
         if isinstance(handler_meta, dict):
             request.metadata = {**(request.metadata or {}), **handler_meta}
         # Other filter types can be handled here if needed
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    extract = validate_extract(request.extract) if request.extract else None
 
-    if request.status:
-        stmt = stmt.where(ThreadORM.status == request.status)
-
-    if request.metadata:
-        # JSONB containment: type-correct, deep-nested, GIN-indexable. Mirrors
-        # AssistantService.search_assistants for cross-endpoint consistency.
-        stmt = stmt.where(ThreadORM.metadata_json.op("@>")(request.metadata))
-
+    # Only join thread_state when the query actually needs values (filter/projection);
+    # plain list/search scans the narrow thread table without the large state blob.
+    need_state = _wants_state(request)
+    if need_state:
+        stmt = (
+            select(ThreadORM, ThreadStateORM)
+            .outerjoin(ThreadStateORM, ThreadStateORM.thread_id == ThreadORM.thread_id)
+            .where(*_search_filters(request, user))
+        )
+    else:
+        stmt = select(ThreadORM).where(*_search_filters(request, user))
     offset = request.offset or 0
     limit = request.limit or 20
     column, asc = _resolve_sort(request)
@@ -897,10 +1005,165 @@ async def search_threads(
     # primary sort key has duplicates (status buckets, microsecond ties).
     stmt = stmt.order_by(direction, ThreadORM.thread_id.asc()).offset(offset).limit(limit)
 
-    result = await session.scalars(stmt)
-    rows = result.all()
+    if need_state:
+        threads_models = [_serialize_thread(t, state=s) for t, s in (await session.execute(stmt)).all()]
+    else:
+        threads_models = [_serialize_thread(t) for t in (await session.scalars(stmt)).all()]
 
-    # Use safe serialization
-    threads_models = [_serialize_thread(t) for t in rows]
+    if not request.select and not extract:
+        return threads_models
 
-    return threads_models
+    wanted = set(request.select) if request.select else None
+    projected: list[dict[str, Any]] = []
+    for model in threads_models:
+        data = model.model_dump(mode="json")
+        row = {k: v for k, v in data.items() if k in wanted} if wanted else dict(data)
+        if extract:
+            for alias, path in extract.items():
+                row[alias] = extract_path_value(data, path)
+        projected.append(row)
+    return projected
+
+
+@router.post("/threads/count", response_model=int)
+async def count_threads(
+    request: ThreadSearchRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> int:
+    """Count threads matching the given filters.
+
+    Accepts the same filters as `/threads/search` (status, metadata, values,
+    ids) but returns only the total count.
+    """
+    ctx = build_auth_context(user, "threads", "search")
+    value = request.model_dump()
+    filters = await handle_event(ctx, value)
+    if filters and "metadata" in filters:
+        handler_meta = filters["metadata"]
+        if isinstance(handler_meta, dict):
+            request.metadata = {**(request.metadata or {}), **handler_meta}
+
+    stmt = select(func.count()).select_from(ThreadORM)
+    if request.values:  # values filter targets thread_state
+        stmt = stmt.join(ThreadStateORM, ThreadStateORM.thread_id == ThreadORM.thread_id)
+    stmt = stmt.where(*_search_filters(request, user))
+    return await session.scalar(stmt) or 0
+
+
+@router.post("/threads/prune")
+async def prune_threads(
+    request: ThreadPruneRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, int]:
+    """Prune threads by id.
+
+    ``delete`` removes each thread entirely (runs, checkpoints, row);
+    ``keep_latest`` keeps the thread but drops all but the newest checkpoint
+    per namespace. Missing/unowned threads are skipped, not errors.
+    """
+    ctx = build_auth_context(user, "threads", "delete")
+    await handle_event(ctx, {"thread_ids": request.thread_ids, "strategy": request.strategy})
+
+    if not request.thread_ids:
+        return {"pruned_count": 0}
+
+    owned = list(
+        (
+            await session.scalars(
+                select(ThreadORM.thread_id).where(
+                    ThreadORM.thread_id.in_(request.thread_ids),
+                    ThreadORM.user_id == user.identity,
+                )
+            )
+        ).all()
+    )
+    if request.strategy == "keep_latest":
+        await db_manager.get_checkpointer().aprune_keep_latest(owned)
+        return {"pruned_count": len(owned)}
+
+    pruned = 0
+    for thread_id in owned:
+        try:
+            await delete_thread_by_id(thread_id, user.identity)
+            pruned += 1
+        except HTTPException as exc:
+            # Reference behavior: skip silently, count only successes.
+            logger.debug("Prune skipped thread", thread_id=thread_id, detail=exc.detail)
+    return {"pruned_count": pruned}
+
+
+@router.post("/threads/{thread_id}/copy", response_model=Thread, responses={**NOT_FOUND})
+async def copy_thread(
+    thread_id: str,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Thread:
+    """Copy a thread and its full checkpoint history into a new thread.
+
+    Creates a new idle thread owned by the caller, duplicating the source
+    thread's metadata and every checkpoint. The original is unchanged. Cost is
+    O(checkpoint history) — avoid on very large threads.
+    """
+    ctx = build_auth_context(user, "threads", "create")
+    await handle_event(ctx, {"thread_id": thread_id})
+
+    src = await session.scalar(
+        select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    )
+    if not src:
+        raise HTTPException(404, f"Thread '{thread_id}' not found")
+
+    new_thread_id = str(uuid4())
+    new_thread = ThreadORM(
+        thread_id=new_thread_id,
+        status="idle",
+        metadata_json=dict(src.metadata_json or {}),
+        user_id=user.identity,
+    )
+    session.add(new_thread)
+    # Carry the materialized state over too (checkpointer rows copied below).
+    src_state = await session.scalar(select(ThreadStateORM).where(ThreadStateORM.thread_id == thread_id))
+    if src_state is not None:
+        session.add(
+            ThreadStateORM(
+                thread_id=new_thread_id,
+                values=src_state.values,
+                interrupts=src_state.interrupts,
+                values_hash=src_state.values_hash,
+            )
+        )
+    await session.commit()
+
+    await _copy_thread_checkpoints(thread_id, new_thread_id)
+
+    return _serialize_thread(new_thread)
+
+
+# Explicit column lists — the saver has no copy API, so we duplicate its rows
+# directly (same coupling as adelete_thread) with the thread_id remapped.
+_COPY_STATEMENTS = (
+    "INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata) "
+    "SELECT %s, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata "
+    "FROM checkpoints WHERE thread_id = %s",
+    "INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob) "
+    "SELECT %s, checkpoint_ns, channel, version, type, blob "
+    "FROM checkpoint_blobs WHERE thread_id = %s",
+    "INSERT INTO checkpoint_writes "
+    "(thread_id, checkpoint_ns, checkpoint_id, task_id, task_path, idx, channel, type, blob) "
+    "SELECT %s, checkpoint_ns, checkpoint_id, task_id, task_path, idx, channel, type, blob "
+    "FROM checkpoint_writes WHERE thread_id = %s",
+)
+
+
+async def _copy_thread_checkpoints(src_thread_id: str, dst_thread_id: str) -> None:
+    """Duplicate all checkpoint rows from src to dst thread."""
+    pool = db_manager.lg_pool
+    if pool is None:
+        raise HTTPException(503, "Checkpoint store not initialized")
+    # One transaction so a partial failure never leaves half-copied checkpoints,
+    # regardless of the pool's autocommit setting.
+    async with pool.connection() as conn, conn.transaction():
+        for stmt in _COPY_STATEMENTS:
+            await conn.execute(stmt, (dst_thread_id, src_thread_id))

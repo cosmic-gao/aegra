@@ -205,7 +205,8 @@ class TestRunsEndpoints:
 
         assert result.run_id == run_id
         assert result.status == "pending"
-        mock_session.refresh.assert_called_once_with(run_orm)
+        # No redundant refresh: the per-request scalar() row is already current.
+        mock_session.refresh.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_run_not_found(self, mock_user: User, mock_session: AsyncMock) -> None:

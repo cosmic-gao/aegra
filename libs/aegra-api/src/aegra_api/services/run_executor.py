@@ -7,13 +7,18 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import select
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_ctx import with_auth_ctx
+from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
+from aegra_api.core.serializers.langgraph import LangGraphSerializer
 from aegra_api.models.run_job import RunJob
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.native_stream import stream_native_v3_events
@@ -21,6 +26,7 @@ from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.webhooks import deliver_webhook
 from aegra_api.settings import settings
 from aegra_api.utils.run_utils import map_command_to_langgraph
 
@@ -48,6 +54,8 @@ async def execute_run(job: RunJob) -> None:
     run_id = job.identity.run_id
     thread_id = job.identity.thread_id
     is_lease_loss = False
+    run_started_at = datetime.now(UTC)
+    outcome: dict[str, Any] | None = None
 
     try:
         await update_run_status(run_id, "running")
@@ -61,7 +69,9 @@ async def execute_run(job: RunJob) -> None:
                 status="interrupted",
                 thread_status="interrupted",
                 output=final_output.data,
+                interrupts=final_output.interrupts,
             )
+            outcome = {"status": "interrupted", "values": final_output.data, "error": None}
         else:
             await finalize_run(
                 run_id,
@@ -70,6 +80,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
+            outcome = {"status": "success", "values": final_output.data, "error": None}
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -79,14 +90,19 @@ async def execute_run(job: RunJob) -> None:
             is_lease_loss = True
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
         else:
-            await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
+            # No output: a cancel has no new state, so don't materialize thread_state
+            # (an empty output would wipe the thread's real materialized values).
+            await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle")
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
+            outcome = {"status": "interrupted", "values": {}, "error": None}
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
         safe_message = f"{type(exc).__name__}: execution failed"
-        await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
+        # No output: a failed run has no new state to materialize into thread_state.
+        await finalize_run(run_id, thread_id, status="error", thread_status="error", error=str(exc))
         await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
+        outcome = {"status": "error", "values": {}, "error": safe_message}
     else:
         status = "interrupted" if final_output.has_interrupt else "success"
         await _best_effort_signal(_signal_end_event, run_id, status)
@@ -96,6 +112,8 @@ async def execute_run(job: RunJob) -> None:
         if not is_lease_loss:
             await streaming_service.cleanup_run(run_id)
             await _signal_run_done(run_id)
+            if outcome is not None and job.execution.webhook:
+                _fire_webhook(job, outcome, run_started_at)
 
 
 # ------------------------------------------------------------------
@@ -118,11 +136,22 @@ async def _best_effort_signal(fn: Any, *args: Any) -> None:
 class _GraphResult:
     """Accumulates output and interrupt state during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt")
+    __slots__ = ("data", "has_interrupt", "interrupts")
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
+        self.interrupts: dict[str, list[Any]] = {}
+
+
+async def _read_interrupts_map(graph: Any, run_config: dict[str, Any], run_id: str) -> dict[str, list[Any]]:
+    """Read the graph's state and group interrupts by task id (SDK Thread.interrupts shape)."""
+    try:
+        state = await graph.aget_state(run_config)
+    except Exception as exc:
+        logger.warning("Could not read interrupts map", run_id=run_id, error=str(exc))
+        return {}
+    return LangGraphSerializer().build_interrupts_map(state)
 
 
 async def _stream_graph(job: RunJob) -> _GraphResult:
@@ -149,6 +178,11 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         else:
             await _stream_legacy(job, graph, execution_input, run_config, stream_modes, result)
 
+        # Read authoritative task ids from state to key interrupts (the streamed
+        # __interrupt__ channel is flat); done inside the graph context.
+        if result.has_interrupt:
+            result.interrupts = await _read_interrupts_map(graph, run_config, job.identity.run_id)
+
     return result
 
 
@@ -169,6 +203,7 @@ async def _stream_legacy(
         stream_mode=stream_modes,
         context=job.execution.context,
         subgraphs=job.behavior.subgraphs,
+        durability=job.execution.durability,
         on_checkpoint=lambda _: None,
         on_task_result=lambda _: None,
     ):
@@ -289,3 +324,48 @@ async def _signal_run_done(run_id: str) -> None:
         await client.set(done_key, "1", ex=_DONE_KEY_TTL_SECONDS)
     except Exception:
         logger.debug("Redis done-key set failed (non-critical)", run_id=run_id)
+
+
+# ------------------------------------------------------------------
+# Webhook delivery (fired on terminal state)
+# ------------------------------------------------------------------
+
+# Hold references to in-flight delivery tasks so they aren't GC'd mid-flight.
+_webhook_tasks: set[asyncio.Task[None]] = set()
+
+
+def _fire_webhook(job: RunJob, outcome: dict[str, Any], run_started_at: datetime) -> None:
+    """Spawn a background task to POST the run's final payload to its webhook."""
+    if not settings.webhook.WEBHOOK_ENABLED:
+        return
+    task = asyncio.create_task(_send_run_webhook(job, outcome, run_started_at))
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
+
+
+async def _send_run_webhook(job: RunJob, outcome: dict[str, Any], run_started_at: datetime) -> None:
+    webhook_url = job.execution.webhook
+    if not webhook_url:
+        return
+    payload = await _build_webhook_payload(job, outcome, run_started_at)
+    await deliver_webhook(webhook_url, payload)
+
+
+async def _build_webhook_payload(job: RunJob, outcome: dict[str, Any], run_started_at: datetime) -> dict[str, Any]:
+    """Assemble the Run-shaped webhook payload (matches LangGraph Platform)."""
+    now = datetime.now(UTC)
+    maker = _get_session_maker()
+    async with maker() as session:
+        run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == job.identity.run_id))
+    return {
+        "run_id": job.identity.run_id,
+        "thread_id": job.identity.thread_id,
+        "assistant_id": run_orm.assistant_id if run_orm else None,
+        "status": outcome["status"],
+        "run_started_at": run_started_at.isoformat(),
+        "run_ended_at": now.isoformat(),
+        "webhook_sent_at": now.isoformat(),
+        "values": outcome["values"],
+        "error": outcome["error"],
+        "metadata": job.run_metadata,
+    }

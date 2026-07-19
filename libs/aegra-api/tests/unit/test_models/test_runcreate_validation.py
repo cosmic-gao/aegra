@@ -33,14 +33,11 @@ class TestRunCreateValidation:
 
 
 class TestRunCreateMetadataValidation:
-    """Tests for ``RunCreate.metadata`` shape enforcement.
+    """``RunCreate.metadata`` accepts arbitrary JSON (SDK ``Json`` type).
 
-    The schema constrains user-supplied metadata to OTEL-attribute
-    primitives at request time so the contract is honest in the OpenAPI
-    schema.  Previously ``dict[str, Any]`` accepted nested values that
-    were silently dropped downstream by ``merge_run_metadata``; surfacing
-    the rejection as a 422 means clients can fix the payload upstream
-    rather than wonder why their metadata never reaches Langfuse.
+    The only limit is a serialized-size cap to close the DoS surface; shape is
+    unconstrained (nested objects, lists, and arbitrary keys are all allowed),
+    matching what the LangGraph SDK sends.
     """
 
     def _payload(self, **overrides):
@@ -56,58 +53,32 @@ class TestRunCreateMetadataValidation:
         run_create = RunCreate(**self._payload(metadata={}))
         assert run_create.metadata == {}
 
-    def test_all_primitive_types_accepted(self):
+    def test_primitive_values_accepted(self):
         run_create = RunCreate(**self._payload(metadata={"tenant": "acme", "retries": 3, "ratio": 0.5, "flag": True}))
-        assert run_create.metadata == {
-            "tenant": "acme",
-            "retries": 3,
-            "ratio": 0.5,
-            "flag": True,
-        }
+        assert run_create.metadata["tenant"] == "acme"
 
-    def test_nested_dict_value_rejected(self):
-        with pytest.raises(ValidationError):
-            RunCreate(**self._payload(metadata={"k": {"nested": 1}}))
+    def test_nested_dict_value_accepted(self):
+        run_create = RunCreate(**self._payload(metadata={"k": {"nested": {"deep": 1}}}))
+        assert run_create.metadata == {"k": {"nested": {"deep": 1}}}
 
-    def test_list_value_rejected(self):
-        with pytest.raises(ValidationError):
-            RunCreate(**self._payload(metadata={"k": [1, 2, 3]}))
+    def test_list_value_accepted(self):
+        run_create = RunCreate(**self._payload(metadata={"k": [1, 2, 3]}))
+        assert run_create.metadata == {"k": [1, 2, 3]}
 
-    def test_too_many_keys_rejected(self):
-        with pytest.raises(ValidationError, match="exceeds 32 keys"):
-            RunCreate(**self._payload(metadata={f"k{i}": i for i in range(33)}))
+    def test_many_keys_accepted(self):
+        run_create = RunCreate(**self._payload(metadata={f"k{i}": i for i in range(200)}))
+        assert len(run_create.metadata) == 200
 
-    def test_dotted_key_rejected(self):
-        """Reject keys containing ``.`` so users cannot land bare attributes
-        like ``langfuse.user.id`` next to the system ones via the
-        ``langfuse.trace.metadata.<key>`` channel."""
-        with pytest.raises(ValidationError, match="must match"):
-            RunCreate(**self._payload(metadata={"langfuse.user.id": "spoof"}))
+    def test_dotted_and_arbitrary_keys_accepted(self):
+        run_create = RunCreate(**self._payload(metadata={"a.b.c": 1, "any key!": 2}))
+        assert run_create.metadata["a.b.c"] == 1
 
-    def test_empty_key_rejected(self):
-        with pytest.raises(ValidationError, match="must match"):
-            RunCreate(**self._payload(metadata={"": "v"}))
+    def test_oversized_metadata_rejected(self):
+        with pytest.raises(ValidationError, match="exceeds"):
+            RunCreate(**self._payload(metadata={"big": "v" * 70_000}))
 
-    def test_too_long_key_rejected(self):
-        with pytest.raises(ValidationError, match="must match"):
-            RunCreate(**self._payload(metadata={"k" * 65: "v"}))
-
-    def test_non_ascii_key_rejected(self):
-        """Reject non-ASCII keys to prevent visual-spoof of join keys
-        (e.g. ``run_id`` vs ``run_id​`` zero-width-space variant)."""
-        with pytest.raises(ValidationError, match="must match"):
-            RunCreate(**self._payload(metadata={"run_id​": "v"}))
-
-    def test_too_long_string_value_rejected(self):
-        with pytest.raises(ValidationError, match="exceeds 512 characters"):
-            RunCreate(**self._payload(metadata={"k": "v" * 513}))
-
-    def test_max_keys_exactly_32_accepted(self):
-        """Boundary: exactly 32 keys is allowed."""
-        run_create = RunCreate(**self._payload(metadata={f"k{i}": i for i in range(32)}))
-        assert len(run_create.metadata) == 32
-
-    def test_max_value_length_exactly_512_accepted(self):
-        """Boundary: exactly 512 chars is allowed."""
-        run_create = RunCreate(**self._payload(metadata={"k": "v" * 512}))
-        assert len(run_create.metadata["k"]) == 512
+    def test_non_json_serializable_metadata_rejected(self):
+        # A non-JSON value (set) must raise a clean validation error, not a 500
+        # from json.dumps in the size-cap validator.
+        with pytest.raises(ValidationError, match="JSON-serializable"):
+            RunCreate(**self._payload(metadata={"bad": {1, 2}}))

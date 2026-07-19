@@ -105,6 +105,7 @@ async def stream_graph_events(
     context: dict[str, Any] | None = None,
     subgraphs: bool = False,
     output_keys: list[str] | None = None,
+    durability: str | None = None,
     on_checkpoint: Callable[[CheckpointPayload | None], None] = lambda _: None,
     on_task_result: Callable[[TaskResultPayload], None] = lambda _: None,
 ) -> AnyStream:
@@ -170,6 +171,10 @@ async def stream_graph_events(
     # Choose streaming method based on mode and graph type
     use_astream_events = "events" in stream_mode or is_js_graph
 
+    # Only forward durability when set, so None keeps langgraph's default and
+    # graph types that don't accept the kwarg (e.g. JS remote) are unaffected.
+    durability_kwargs: dict[str, Any] = {"durability": durability} if durability is not None else {}
+
     # Yield metadata event
     yield (
         "metadata",
@@ -186,6 +191,7 @@ async def stream_graph_events(
                 version="v2",
                 stream_mode=list(stream_modes_set),
                 subgraphs=subgraphs,
+                **durability_kwargs,
             )
         ) as stream:
             async for event in stream:
@@ -272,6 +278,7 @@ async def stream_graph_events(
                 stream_mode=list(stream_modes_set),
                 output_keys=output_keys,
                 subgraphs=subgraphs,
+                **durability_kwargs,
             )
         ) as stream:
             async for event in stream:

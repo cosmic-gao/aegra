@@ -675,10 +675,12 @@ class TestGetAssistantSchemas:
     def test_get_assistant_schemas(self, client, mock_assistant_service):
         """Test getting assistant schemas"""
         schemas = {
+            "graph_id": "test-graph",
             "input_schema": {"type": "object", "properties": {}},
             "output_schema": {"type": "object", "properties": {}},
             "config_schema": {"type": "object", "properties": {}},
             "state_schema": {"type": "object", "properties": {}},
+            "context_schema": {"type": "object", "properties": {}},
         }
         mock_assistant_service.get_assistant_schemas.return_value = schemas
 
@@ -686,10 +688,28 @@ class TestGetAssistantSchemas:
 
         assert resp.status_code == 200
         data = resp.json()
+        assert data["graph_id"] == "test-graph"
         assert "input_schema" in data
         assert "output_schema" in data
         assert "config_schema" in data
         assert "state_schema" in data
+        assert "context_schema" in data
+
+    def test_get_assistant_schemas_allows_null_schemas(self, client, mock_assistant_service):
+        """A graph that can't produce a JSON schema yields nulls, not a 500."""
+        mock_assistant_service.get_assistant_schemas.return_value = {
+            "graph_id": "test-graph",
+            "input_schema": None,
+            "output_schema": None,
+            "config_schema": None,
+            "state_schema": None,
+            "context_schema": None,
+        }
+
+        resp = client.get("/assistants/test-assistant-123/schemas")
+
+        assert resp.status_code == 200
+        assert resp.json()["input_schema"] is None
 
 
 class TestGetAssistantGraph:

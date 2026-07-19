@@ -143,12 +143,36 @@ class Thread(Base):
     status: Mapped[str] = mapped_column(Text, server_default=text("'idle'"))
     # Database column is 'metadata_json' (per database.py). ORM attribute 'metadata_json' must map to that column.
     metadata_json: Mapped[dict] = mapped_column("metadata_json", JsonbSafe, server_default=text("'{}'::jsonb"))
+    # Per-thread retention: {"strategy": "delete", "ttl": <minutes>}.
+    ttl: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
     # Indexes for performance
     __table_args__ = (Index("idx_thread_user", "user_id"),)
+
+
+class ThreadState(Base):
+    """Materialized latest state for a thread (1:1 with ``thread``).
+
+    Split out of the ``thread`` row so list/search/count scan a narrow table and
+    the large state blob doesn't bloat it. Written on run finalize and state
+    updates (gated by ``THREAD_STATE_MATERIALIZE``); the checkpointer remains the
+    source of truth. Only threads whose state has been materialized have a row.
+    """
+
+    __tablename__ = "thread_state"
+
+    thread_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("thread.thread_id", ondelete="CASCADE"), primary_key=True
+    )
+    values: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
+    # Task-keyed interrupts map ({task_id: [...]}) matching the SDK Thread shape.
+    interrupts: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
+    # md5(values::text) to skip no-op rewrites when the state is unchanged.
+    values_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
 
 class Run(Base):
@@ -166,6 +190,11 @@ class Run(Base):
     context: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     output: Mapped[dict | None] = mapped_column(JsonbSafe)
     error_message: Mapped[str | None] = mapped_column(Text)
+    # SDK Run exposes metadata + multitask_strategy as first-class, selectable
+    # fields; keep them as real columns (name-mapped like assistant/cron) rather
+    # than deriving from the execution_params blob (which also holds trace/user).
+    metadata_dict: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"), name="metadata")
+    multitask_strategy: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
@@ -180,6 +209,10 @@ class Run(Base):
     claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    # Delayed runs (after_seconds): future timestamp before which the run must
+    # not be submitted. NULL means "ready now".
+    scheduled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
     # Indexes for performance
     __table_args__ = (
         Index("idx_runs_thread_id", "thread_id"),
@@ -188,6 +221,14 @@ class Run(Base):
         Index("idx_runs_assistant_id", "assistant_id"),
         Index("idx_runs_created_at", "created_at"),
         Index("idx_runs_lease_reaper", "status", "lease_expires_at"),
+        Index("idx_runs_scheduled", "status", "scheduled_at"),
+        # Hard invariant for multitask serialization: at most one running run per thread.
+        Index(
+            "uq_runs_one_running_per_thread",
+            "thread_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
     )
 
 

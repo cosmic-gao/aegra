@@ -41,6 +41,10 @@ class RunExecution(BaseModel):
     stream_mode: str | list[str] | None = None
     checkpoint: dict[str, Any] | None = None
     command: dict[str, Any] | None = None
+    # Optional http(s) URL POSTed with the final Run payload on terminal state.
+    webhook: str | None = None
+    # Checkpoint persistence mode forwarded to the LangGraph runtime.
+    durability: str | None = None
     # When true, stream via the native v3 protocol producer for Agent Protocol v2.
     event_streaming_v2: bool = False
 

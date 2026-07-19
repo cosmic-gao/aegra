@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from redis import RedisError
 from sqlalchemy import delete, select, update
@@ -17,15 +17,18 @@ from sse_starlette import EventSourceResponse
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker, get_session
 from aegra_api.core.sse import create_end_event, get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import Run, RunCreate, RunStatus, User
+from aegra_api.models.enums import CancelAction
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
+from aegra_api.models.runs import RunsCancelRequest
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_preparation import _prepare_run
-from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body
+from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, wrap_run_result
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.status_compat import validate_run_status
@@ -167,32 +170,53 @@ async def get_run(
     if not run_orm:
         raise HTTPException(404, f"Run '{run_id}' not found")
 
-    # Refresh to ensure we have the latest data (in case background task updated it)
-    await session.refresh(run_orm)
-
+    # No refresh needed: fresh per-request session + expire_on_commit=False means
+    # the scalar() row is already current; a refresh() would just re-SELECT it.
     logger.info(
         f"[get_run] found run status={run_orm.status} user={user.identity} thread_id={thread_id} run_id={run_id}"
     )
-    # Convert to Pydantic
     return Run.model_validate(run_orm)
 
 
-@router.get("/threads/{thread_id}/runs", response_model=list[Run])
+# SDK RunSelectField values; fields Aegra does not store are omitted from rows.
+_RUN_SELECT_FIELDS = frozenset(
+    {
+        "run_id",
+        "thread_id",
+        "assistant_id",
+        "created_at",
+        "updated_at",
+        "status",
+        "metadata",
+        "kwargs",
+        "multitask_strategy",
+    }
+)
+
+
+@router.get("/threads/{thread_id}/runs")
 async def list_runs(
     thread_id: str,
-    limit: int = Query(10, ge=1, description="Maximum number of runs to return"),
+    limit: int = Query(10, ge=1, le=1000, description="Maximum number of runs to return"),
     offset: int = Query(0, ge=0, description="Number of runs to skip for pagination"),
     status: str | None = Query(
         None, description="Filter by run status (e.g. pending, running, success, error, interrupted)"
     ),
+    select_fields: list[str] | None = Query(
+        None, alias="select", description="Return only these run fields (SDK RunSelectField values)."
+    ),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
-) -> list[Run]:
+) -> list[Run] | list[dict[str, Any]]:
     """List runs for a thread.
 
     Returns runs ordered by creation time (newest first). Use `status` to
-    filter and `limit`/`offset` to paginate.
+    filter, `limit`/`offset` to paginate, and `select` to project fields.
     """
+    if select_fields:
+        invalid = [f for f in select_fields if f not in _RUN_SELECT_FIELDS]
+        if invalid:
+            raise HTTPException(422, f"Invalid select columns: {invalid}. Expected: {sorted(_RUN_SELECT_FIELDS)}")
     stmt = (
         select(RunORM)
         .where(
@@ -209,6 +233,9 @@ async def list_runs(
     rows = result.all()
     runs = [Run.model_validate(r) for r in rows]
     logger.info(f"[list_runs] total={len(runs)} user={user.identity} thread_id={thread_id}")
+    if select_fields:
+        wanted = set(select_fields)
+        return [{k: v for k, v in r.model_dump(mode="json").items() if k in wanted} for r in runs]
     return runs
 
 
@@ -297,8 +324,9 @@ async def join_run(
             raise HTTPException(404, f"Run '{run_id}' not found")
 
         if run_orm.status in TERMINAL_STATES:
+            result = wrap_run_result(run_orm.status, run_orm.output, run_orm.error_message)
             return StreamingResponse(
-                iter([encode_output(run_orm.output or {})]),
+                iter([encode_output(result)]),
                 media_type="application/json",
             )
 
@@ -427,6 +455,79 @@ async def stream_run(
     )
 
 
+_THREAD_STREAM_MODES = frozenset({"run_modes", "lifecycle", "state_update"})
+
+
+@router.get("/threads/{thread_id}/stream", responses={**SSE_RESPONSE, **NOT_FOUND})
+async def join_thread_stream(
+    thread_id: str,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+    stream_mode: str | None = Query(
+        None, description="Comma-separated ThreadStreamMode values (SDK sends 'stream_mode')."
+    ),
+    user: User = Depends(get_current_user),
+) -> EventSourceResponse:
+    """Join the stream of the thread's active (or most recent) run.
+
+    Resolves the thread's in-flight run — falling back to the newest run —
+    and attaches to its event stream with `Last-Event-ID` replay, exactly
+    like the run-scoped stream endpoint. Only `run_modes` is served.
+    """
+    requested = [m.strip() for m in stream_mode.split(",")] if stream_mode else ["run_modes"]
+    invalid = [m for m in requested if m not in _THREAD_STREAM_MODES]
+    if invalid:
+        raise HTTPException(422, f"Invalid stream mode: {invalid[0]}")
+    if "run_modes" not in requested:
+        raise HTTPException(422, "Only the 'run_modes' thread stream mode is supported")
+
+    maker = _get_session_maker()
+    async with maker() as session:
+        run_orm = await session.scalar(
+            select(RunORM)
+            .where(
+                RunORM.thread_id == thread_id,
+                RunORM.user_id == user.identity,
+                RunORM.status.in_(("pending", "running")),
+            )
+            .order_by(RunORM.created_at.desc())
+            .limit(1)
+        )
+        if run_orm is None:
+            run_orm = await session.scalar(
+                select(RunORM)
+                .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
+                .order_by(RunORM.created_at.desc())
+                .limit(1)
+            )
+        if run_orm is None:
+            raise HTTPException(404, f"Thread '{thread_id}' has no runs to stream")
+        run_status = run_orm.status
+        run_model = Run.model_validate(run_orm)
+
+    if run_status in TERMINAL_STATES and not last_event_id:
+
+        async def generate_final() -> AsyncGenerator[str, None]:
+            yield create_end_event(status="error" if run_status == "error" else run_status)
+
+        return make_sse_response(
+            sse_to_bytes(generate_final()),
+            headers={
+                **get_sse_headers(),
+                "Location": f"/threads/{thread_id}/stream",
+                "Content-Location": f"/threads/{thread_id}/runs/{run_model.run_id}",
+            },
+        )
+
+    return make_sse_response(
+        sse_to_bytes(streaming_service.stream_run_execution(run_model, last_event_id)),
+        headers={
+            **get_sse_headers(),
+            "Location": f"/threads/{thread_id}/stream",
+            "Content-Location": f"/threads/{thread_id}/runs/{run_model.run_id}",
+        },
+    )
+
+
 @router.post(
     "/threads/{thread_id}/runs/{run_id}/cancel",
     response_model=Run,
@@ -436,20 +537,23 @@ async def cancel_run_endpoint(
     thread_id: str,
     run_id: str,
     wait: int = Query(0, ge=0, le=1, description="Set to 1 to wait for the run task to settle before returning."),
-    action: str = Query(
-        "cancel",
-        pattern="^(cancel|interrupt)$",
-        description="Cancellation strategy: 'cancel' for hard cancel, 'interrupt' for cooperative interrupt.",
+    action: CancelAction = Query(
+        "interrupt",
+        description=(
+            "Cancellation strategy: 'interrupt' (default) for a cooperative "
+            "interrupt that lets the graph save partial state, or 'rollback' to "
+            "cancel then delete the run and the checkpoints it produced."
+        ),
     ),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> Run:
     """Cancel or interrupt a running execution.
 
-    Use `action=cancel` to hard-cancel the run immediately, or
-    `action=interrupt` to cooperatively interrupt (the graph can handle the
-    interrupt and save partial state). Set `wait=1` to block until the
-    background task has fully settled before returning the updated run.
+    Use `action=interrupt` (default) to cooperatively interrupt so the graph can
+    handle the interrupt and save partial state, or `action=rollback` to cancel
+    and then discard the run record plus its checkpoints. Set `wait=1` to block
+    until the background task has fully settled before returning the updated run.
     """
     logger.info(f"[cancel_run] fetch run run_id={run_id} thread_id={thread_id} user={user.identity}")
     run_orm = await session.scalar(
@@ -465,26 +569,17 @@ async def cancel_run_endpoint(
     if action == "interrupt":
         logger.info(f"[cancel_run] interrupt run_id={run_id} user={user.identity} thread_id={thread_id}")
         await streaming_service.interrupt_run(run_id)
-        # Persist status as interrupted
-        await session.execute(
-            update(RunORM)
-            .where(RunORM.run_id == str(run_id))
-            .values(status="interrupted", updated_at=datetime.now(UTC))
-        )
-        await session.commit()
     else:
-        logger.info(f"[cancel_run] cancel run_id={run_id} user={user.identity} thread_id={thread_id}")
+        logger.info(f"[cancel_run] {action} run_id={run_id} user={user.identity} thread_id={thread_id}")
         await streaming_service.cancel_run(run_id)
-        # Persist status as interrupted
-        await session.execute(
-            update(RunORM)
-            .where(RunORM.run_id == str(run_id))
-            .values(status="interrupted", updated_at=datetime.now(UTC))
-        )
-        await session.commit()
+    await session.execute(
+        update(RunORM).where(RunORM.run_id == str(run_id)).values(status="interrupted", updated_at=datetime.now(UTC))
+    )
+    await session.commit()
 
-    # Optionally wait for the run to settle
-    if wait:
+    # Rollback must always settle first: deleting checkpoints while the
+    # executor is still finalizing would let it write rows back afterwards.
+    if wait or action == "rollback":
         # Poll DB until the run reaches a terminal state (or 10s timeout).
         # This is simpler and more reliable than pub/sub for cancel-with-wait
         # since the cancel has already been issued and the status update committed.
@@ -495,7 +590,7 @@ async def cancel_run_endpoint(
             if fresh and fresh.status in TERMINAL_STATES:
                 break
 
-    # Reload and return updated Run (do NOT delete here; deletion is a separate endpoint)
+    # Reload the settled snapshot (also what a rollback returns post-delete).
     run_orm = await session.scalar(
         select(RunORM).where(
             RunORM.run_id == run_id,
@@ -505,7 +600,62 @@ async def cancel_run_endpoint(
     )
     if not run_orm:
         raise HTTPException(404, f"Run '{run_id}' not found after cancellation")
-    return Run.model_validate(run_orm)
+    run = Run.model_validate(run_orm)
+
+    if action == "rollback":
+        await db_manager.get_checkpointer().adelete_for_runs([run_id])
+        await session.delete(run_orm)
+        await session.commit()
+    return run
+
+
+@router.post("/runs/cancel", status_code=204)
+async def cancel_runs_bulk(
+    request: RunsCancelRequest,
+    action: str = Query(
+        "interrupt",
+        pattern="^(interrupt|rollback)$",
+        description="'interrupt' marks runs interrupted; 'rollback' also deletes them and their checkpoints.",
+    ),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Bulk-cancel runs by status, or by thread_id + run_ids."""
+    where = [RunORM.user_id == user.identity]
+    if request.status is not None:
+        statuses = ("pending", "running") if request.status == "all" else (request.status,)
+        where.append(RunORM.status.in_(statuses))
+    else:
+        where.append(RunORM.thread_id == request.thread_id)
+        where.append(RunORM.run_id.in_(request.run_ids or []))
+    rows = list((await session.scalars(select(RunORM).where(*where))).all())
+    if not rows:
+        raise HTTPException(404, "No runs found to cancel")
+
+    run_ids = [row.run_id for row in rows]
+    for rid in run_ids:
+        if action == "interrupt":
+            await streaming_service.interrupt_run(rid)
+        else:
+            await streaming_service.cancel_run(rid)
+    await session.execute(
+        update(RunORM).where(RunORM.run_id.in_(run_ids)).values(status="interrupted", updated_at=datetime.now(UTC))
+    )
+    await session.commit()
+
+    if action == "rollback":
+        # Settle before deleting checkpoints so a finalizing executor cannot
+        # write rows back afterwards (bounded to the single-cancel wait).
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            session.expire_all()
+            statuses = (await session.scalars(select(RunORM.status).where(RunORM.run_id.in_(run_ids)))).all()
+            if all(s in TERMINAL_STATES for s in statuses):
+                break
+        await db_manager.get_checkpointer().adelete_for_runs(run_ids)
+        await session.execute(delete(RunORM).where(RunORM.run_id.in_(run_ids)))
+        await session.commit()
+    return Response(status_code=204)
 
 
 @router.delete(

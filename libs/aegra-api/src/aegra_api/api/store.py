@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+from langgraph.store.base import NOT_PROVIDED, NotProvided
 
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
@@ -9,10 +10,10 @@ from aegra_api.core.database import db_manager
 from aegra_api.models import (
     StoreDeleteRequest,
     StoreGetResponse,
-    StoreItem,
     StoreListNamespacesRequest,
     StoreListNamespacesResponse,
     StorePutRequest,
+    StoreSearchItem,
     StoreSearchRequest,
     StoreSearchResponse,
     User,
@@ -48,7 +49,15 @@ async def put_store_item(request: StorePutRequest, user: User = Depends(get_curr
 
     store = db_manager.get_store()
 
-    await store.aput(namespace=tuple(scoped_namespace), key=request.key, value=request.value)
+    # NOT_PROVIDED keeps the store's default TTL; an explicit null would clear it.
+    ttl: float | NotProvided | None = request.ttl if request.ttl is not None else NOT_PROVIDED
+    await store.aput(
+        namespace=tuple(scoped_namespace),
+        key=request.key,
+        value=request.value,
+        index=request.index,
+        ttl=ttl,
+    )
 
     return Response(status_code=204)
 
@@ -59,6 +68,7 @@ async def get_store_item(
     namespace: str | list[str] | None = Query(
         None, description="Namespace path. Use dot-separated string or repeated query params."
     ),
+    refresh_ttl: bool | None = Query(None, description="Whether this read refreshes the item's TTL."),
     user: User = Depends(get_current_user),
 ) -> StoreGetResponse:
     """Get an item from the store by key.
@@ -82,12 +92,18 @@ async def get_store_item(
 
     store = db_manager.get_store()
 
-    item = await store.aget(tuple(scoped_namespace), key)
+    item = await store.aget(tuple(scoped_namespace), key, refresh_ttl=refresh_ttl)
 
     if not item:
         raise HTTPException(404, "Item not found")
 
-    return StoreGetResponse(key=key, value=item.value, namespace=list(scoped_namespace))
+    return StoreGetResponse(
+        key=key,
+        value=item.value,
+        namespace=list(scoped_namespace),
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
 
 
 @router.delete("/store/items", status_code=204)
@@ -172,9 +188,20 @@ async def search_store_items(
         filter=request.filter,
         limit=request.limit or 20,
         offset=request.offset or 0,
+        refresh_ttl=request.refresh_ttl,
     )
 
-    items = [StoreItem(key=r.key, value=r.value, namespace=list(r.namespace)) for r in results]
+    items = [
+        StoreSearchItem(
+            key=r.key,
+            value=r.value,
+            namespace=list(r.namespace),
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+            score=getattr(r, "score", None),
+        )
+        for r in results
+    ]
 
     return StoreSearchResponse(
         items=items,

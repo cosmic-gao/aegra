@@ -102,8 +102,8 @@ class TestReadRunOutput:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_returns_error_output_as_is(self) -> None:
-        """Error run output is returned without transformation."""
+    async def test_returns_error_envelope_for_failed_run(self) -> None:
+        """A failed run surfaces the SDK __error__ envelope so wait() can raise."""
         session = AsyncMock()
         session.scalar.return_value = _make_run_orm(
             status="error",
@@ -115,7 +115,7 @@ class TestReadRunOutput:
         with patch("aegra_api.services.run_waiters._get_session_maker", return_value=maker):
             result = await read_run_output("run-1", "thread-1", "test-user")
 
-        assert result == {"error": "something broke"}
+        assert result == {"__error__": {"error": "error", "message": "Graph crashed"}}
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +338,7 @@ class TestJoinRunEndpoint:
 
     @pytest.mark.asyncio
     async def test_error_run_returns_immediately(self) -> None:
-        """Error-state run returns immediately (it's terminal)."""
+        """Error-state run returns immediately (terminal) with the __error__ envelope."""
         run_orm = _make_run_orm(status="error", output={"err": "failed"})
         session = AsyncMock()
         session.scalar.return_value = run_orm
@@ -351,4 +351,4 @@ class TestJoinRunEndpoint:
         body = b""
         async for chunk in response.body_iterator:
             body += chunk if isinstance(chunk, bytes) else chunk.encode()
-        assert json.loads(body) == {"err": "failed"}
+        assert json.loads(body) == {"__error__": {"error": "error", "message": "Run failed"}}

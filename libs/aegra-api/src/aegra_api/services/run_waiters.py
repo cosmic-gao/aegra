@@ -25,12 +25,23 @@ logger = structlog.getLogger(__name__)
 TERMINAL_STATES = {"success", "error", "interrupted"}
 
 
+def wrap_run_result(status: str, output: dict[str, Any] | None, error_message: str | None) -> dict[str, Any]:
+    """Shape a terminal run's payload for the non-streaming wait/join response.
+
+    On error, emit the SDK's in-band ``{"__error__": {...}}`` envelope so
+    ``client.runs.wait(raise_error=True)`` raises instead of returning silently.
+    """
+    if status == "error":
+        return {"__error__": {"error": "error", "message": error_message or "Run failed"}}
+    return output or {}
+
+
 async def read_run_output(
     run_id: str,
     thread_id: str,
     user_id: str,
 ) -> dict[str, Any]:
-    """Open a short-lived DB session and read the run's final output."""
+    """Open a short-lived DB session and read the run's terminal wait/join payload."""
     maker = _get_session_maker()
     async with maker() as session:
         run_orm = await session.scalar(
@@ -42,7 +53,7 @@ async def read_run_output(
         )
         if not run_orm:
             return {}
-        return run_orm.output or {}
+        return wrap_run_result(run_orm.status, run_orm.output, run_orm.error_message)
 
 
 def encode_output(output: dict[str, Any]) -> bytes:

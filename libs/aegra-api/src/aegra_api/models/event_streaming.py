@@ -15,10 +15,10 @@ class EventStreamRequest(BaseModel):
     """
 
     channels: list[str] = Field(..., description="Channels to subscribe to (e.g. messages, values, lifecycle).")
-    namespaces: list[list[str]] | None = Field(None, description="Subgraph namespace prefixes to include.")
-    depth: int | None = Field(None, ge=0, description="Max subgraph nesting depth to include.")
+    namespaces: list[list[str]] | None = Field(default=None, description="Subgraph namespace prefixes to include.")
+    depth: int | None = Field(default=None, ge=0, description="Max subgraph nesting depth to include.")
     since: int | None = Field(
-        None,
+        default=None,
         ge=0,
         description="Last seq the client saw; events at or below it are skipped on resume.",
     )

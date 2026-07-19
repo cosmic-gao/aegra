@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aegra_api.services.run_status import _safe_serialize, set_thread_status, update_run_status
+from aegra_api.services.run_status import (
+    _safe_serialize,
+    finalize_run,
+    set_thread_status,
+    update_run_status,
+)
 
 
 def _make_mock_session() -> AsyncMock:
@@ -43,7 +48,7 @@ class TestUpdateRunStatus:
 
         with (
             patch("aegra_api.services.run_status._get_session_maker", return_value=maker),
-            patch("aegra_api.services.run_status._safe_serialize", return_value={"key": "val"}) as mock_ser,
+            patch("aegra_api.services.run_status._safe_serialize", return_value=({"key": "val"}, True)) as mock_ser,
         ):
             await update_run_status("run-1", "success", output={"key": "val"})
 
@@ -105,12 +110,66 @@ class TestSafeSerialize:
             mock_ser.serialize.return_value = {"a": 1}
             result = _safe_serialize({"a": 1}, "run-1")
 
-        assert result == {"a": 1}
+        assert result == ({"a": 1}, True)
 
     def test_returns_fallback_on_failure(self) -> None:
         with patch("aegra_api.services.run_status._serializer") as mock_ser:
             mock_ser.serialize.side_effect = TypeError("boom")
-            result = _safe_serialize(object(), "run-1")
+            value, ok = _safe_serialize(object(), "run-1")
 
-        assert result["error"] == "Output serialization failed"
-        assert "original_type" in result
+        assert ok is False
+        assert value["error"] == "Output serialization failed"
+        assert "original_type" in value
+
+
+class TestFinalizeRunMaterialization:
+    """finalize_run materializes thread_state only for genuinely serialized state."""
+
+    @pytest.mark.asyncio
+    async def test_no_materialize_when_output_absent(self) -> None:
+        # Cancel/error paths pass no output; materializing an empty {} would wipe
+        # the thread's real materialized values/interrupts.
+        session = _make_mock_session()
+        maker = _make_mock_session_maker(session)
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=maker),
+            patch("aegra_api.services.run_status.materialize_thread_state", new=AsyncMock()) as mat,
+        ):
+            await finalize_run("run-1", "thread-1", status="error", thread_status="error", error="boom")
+
+        mat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_materialize_on_serialization_failure(self) -> None:
+        # The _safe_serialize failure fallback must not be materialized as state.
+        session = _make_mock_session()
+        maker = _make_mock_session_maker(session)
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=maker),
+            patch("aegra_api.services.run_status._safe_serialize", return_value=({"error": "x"}, False)),
+            patch("aegra_api.services.run_status.materialize_thread_state", new=AsyncMock()) as mat,
+        ):
+            await finalize_run("run-1", "thread-1", status="success", thread_status="idle", output={"v": 1})
+
+        mat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_materializes_genuine_state_with_interrupts(self) -> None:
+        session = _make_mock_session()
+        maker = _make_mock_session_maker(session)
+        interrupts = {"t1": [{"value": "x", "id": "i1"}]}
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=maker),
+            patch("aegra_api.services.run_status._safe_serialize", return_value=({"v": 1}, True)),
+            patch("aegra_api.services.run_status.materialize_thread_state", new=AsyncMock()) as mat,
+        ):
+            await finalize_run(
+                "run-1",
+                "thread-1",
+                status="interrupted",
+                thread_status="interrupted",
+                output={"v": 1},
+                interrupts=interrupts,
+            )
+
+        mat.assert_awaited_once_with(session, "thread-1", {"v": 1}, interrupts)

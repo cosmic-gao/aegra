@@ -36,9 +36,8 @@ from aegra_api.settings import settings
 logger = structlog.getLogger(__name__)
 
 
-# Backwards-compat re-export. ``cron_scheduler.py`` previously exposed this
-# helper at module scope and a few tests / callers may still import it from
-# here. Kept thin; the canonical home is now ``cron_service``.
+# Thin backwards-compat proxy so existing ``cron_scheduler`` importers keep
+# working; the canonical home is ``cron_service``.
 def _should_delete_stateless_thread(cron: CronORM) -> bool:
     """Proxy to :func:`aegra_api.services.cron_service.should_delete_stateless_thread`."""
     return should_delete_stateless_thread(cron)
@@ -62,6 +61,11 @@ def _build_run_create(cron: CronORM) -> RunCreate:
         stream_subgraphs=payload.get("stream_subgraphs"),
         stream_mode=payload.get("stream_mode"),
         multitask_strategy=payload.get("multitask_strategy"),
+        webhook=payload.get("webhook"),
+        command=payload.get("command"),
+        durability=payload.get("durability"),
+        after_seconds=payload.get("after_seconds"),
+        if_not_exists="create",
         # Cron metadata_dict is stored on the cron record for search/filter, not
         # forwarded onto fired runs. Re-wire here if run-level tagging is needed.
         metadata=None,
