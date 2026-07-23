@@ -634,11 +634,7 @@ class TestLangGraphServiceConfigs:
         thread_id = "thread-456"
         additional_config = {"custom": "value"}
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
+        result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
 
         assert result["configurable"]["run_id"] == run_id
         assert result["configurable"]["thread_id"] == thread_id
@@ -655,11 +651,7 @@ class TestLangGraphServiceConfigs:
         thread_id = "thread-456"
         checkpoint = {"checkpoint_key": "checkpoint_value"}
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config(run_id, thread_id, mock_user, checkpoint=checkpoint)
+        result = create_run_config(run_id, thread_id, mock_user, checkpoint=checkpoint)
 
         assert result["configurable"]["checkpoint_key"] == "checkpoint_value"
 
@@ -676,11 +668,7 @@ class TestLangGraphServiceConfigs:
 
         attacker_override = {"configurable": {"thread_id": "victim-thread", "run_id": "victim-run"}}
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config("run-789", "thread-456", mock_user, additional_config=attacker_override)
+        result = create_run_config("run-789", "thread-456", mock_user, additional_config=attacker_override)
 
         assert result["configurable"]["thread_id"] == "thread-456"
         assert result["configurable"]["run_id"] == "run-789"
@@ -697,110 +685,17 @@ class TestLangGraphServiceConfigs:
 
         malicious_checkpoint = {"thread_id": "victim-thread", "checkpoint_id": "cp-9"}
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config("run-789", "thread-456", mock_user, checkpoint=malicious_checkpoint)
+        result = create_run_config("run-789", "thread-456", mock_user, checkpoint=malicious_checkpoint)
 
         assert result["configurable"]["thread_id"] == "thread-456"
         assert result["configurable"]["checkpoint_id"] == "cp-9"
-
-    def test_create_run_config_with_tracing_callbacks(self):
-        """Test creating run config with tracing callbacks"""
-        mock_user = Mock()
-        mock_user.identity = "user-123"
-        mock_user.display_name = "Test User"
-
-        run_id = "run-789"
-        thread_id = "thread-456"
-
-        mock_callbacks = [Mock(), Mock()]
-
-        with (
-            patch(
-                "aegra_api.services.langgraph_service.get_tracing_callbacks",
-                return_value=mock_callbacks,
-            ),
-            patch(
-                "aegra_api.services.langgraph_service.get_tracing_metadata",
-                return_value={
-                    "langfuse_session_id": thread_id,
-                    "langfuse_user_id": "user-123",
-                    "langfuse_tags": [
-                        "aegra_run",
-                        f"run:{run_id}",
-                        f"thread:{thread_id}",
-                        f"user:{mock_user.identity}",
-                    ],
-                },
-            ),
-        ):
-            result = create_run_config(run_id, thread_id, mock_user)
-
-        assert result["callbacks"] == mock_callbacks
-        assert result["metadata"]["langfuse_session_id"] == thread_id
-        assert result["metadata"]["langfuse_user_id"] == "user-123"
-        assert "aegra_run" in result["metadata"]["langfuse_tags"]
-        assert f"run:{run_id}" in result["metadata"]["langfuse_tags"]
-        assert f"thread:{thread_id}" in result["metadata"]["langfuse_tags"]
-        assert f"user:{mock_user.identity}" in result["metadata"]["langfuse_tags"]
-
-    def test_create_run_config_existing_callbacks(self):
-        """Test creating run config with existing callbacks"""
-        mock_user = Mock()
-        mock_user.identity = "user-123"
-        mock_user.display_name = "Test User"
-
-        run_id = "run-789"
-        thread_id = "thread-456"
-        existing_callback = Mock()
-        additional_config = {"callbacks": [existing_callback]}
-
-        mock_callbacks = [Mock(), Mock()]
-
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=mock_callbacks,
-        ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
-
-        # Should have existing + tracing callbacks
-        assert len(result["callbacks"]) == 3
-        # Verify structure is correct (don't check exact objects due to Mock ID differences)
-        assert "callbacks" in result
-        assert isinstance(result["callbacks"], list)
-
-    def test_create_run_config_invalid_callbacks(self):
-        """Test creating run config with invalid callbacks type"""
-        mock_user = Mock()
-        mock_user.identity = "user-123"
-        mock_user.display_name = "Test User"
-
-        run_id = "run-789"
-        thread_id = "thread-456"
-        additional_config = {"callbacks": "not_a_list"}
-
-        mock_callbacks = [Mock(), Mock()]
-
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=mock_callbacks,
-        ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
-
-        assert result["callbacks"] == mock_callbacks
 
     def test_create_run_config_no_user(self):
         """Test creating run config without user"""
         run_id = "run-789"
         thread_id = "thread-456"
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config(run_id, thread_id, None)
+        result = create_run_config(run_id, thread_id, None)
 
         assert result["configurable"]["run_id"] == run_id
         assert result["configurable"]["thread_id"] == thread_id
@@ -818,11 +713,7 @@ class TestLangGraphServiceConfigs:
         run_id = "run-abc-123"
         thread_id = "thread-456"
 
-        with patch(
-            "aegra_api.services.langgraph_service.get_tracing_callbacks",
-            return_value=[],
-        ):
-            result = create_run_config(run_id, thread_id, mock_user)
+        result = create_run_config(run_id, thread_id, mock_user)
 
         assert result["run_id"] == run_id
         assert result["configurable"]["run_id"] == run_id

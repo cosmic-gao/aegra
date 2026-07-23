@@ -9,10 +9,12 @@ from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import pytest
+import structlog
 from mcp import types
 
 import aegra_api.services.mcp_server as mcp_server
 from aegra_api.models.auth import User
+from aegra_api.observability.span_enrichment import _trace_attrs
 
 pytestmark = pytest.mark.unit
 
@@ -54,6 +56,16 @@ def _clear_schema_cache():
     mcp_server._SCHEMA_CACHE.clear()
     yield
     mcp_server._SCHEMA_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_trace_context():
+    """_call_tool now binds trace context in-place; reset so it never bleeds."""
+    _trace_attrs.set(None)
+    structlog.contextvars.clear_contextvars()
+    yield
+    _trace_attrs.set(None)
+    structlog.contextvars.clear_contextvars()
 
 
 @pytest.fixture
@@ -115,6 +127,38 @@ async def test_call_tool_runs_graph_and_returns_serialized_output(auth) -> None:
         content = await mcp_server._call_tool("weather", {"messages": ["hi"]})
     assert content[0].type == "text"
     assert json.loads(content[0].text)["echo"] == {"messages": ["hi"]}
+
+
+async def test_call_tool_binds_langfuse_trace_context(auth) -> None:
+    """The graph runs with Langfuse enrichment active — user/session/name/source set.
+
+    Without bind_run_trace_context, MCP-invoked graphs export un-attributed traces
+    (no user, no session grouping, generic trace name).
+    """
+    captured: dict[str, object] = {}
+
+    class _CapturingGraph:
+        def get_input_jsonschema(self) -> dict:
+            return {"type": "object"}
+
+        async def ainvoke(self, input: dict, config: dict) -> dict:
+            captured["attrs"] = _trace_attrs.get()
+            return {"messages": ["done"]}
+
+    class _CapturingService(_FakeService):
+        @asynccontextmanager
+        async def get_graph(self, name: str, user: User | None = None):
+            yield _CapturingGraph()
+
+    with patch.object(mcp_server, "get_langgraph_service", return_value=_CapturingService(("weather",))):
+        await mcp_server._call_tool("weather", {"messages": ["hi"]})
+
+    attrs = captured["attrs"]
+    assert isinstance(attrs, dict)
+    assert attrs["langfuse.user.id"] == "u1"
+    assert attrs["langfuse.trace.name"] == "weather"
+    assert attrs["langfuse.trace.metadata.source"] == "mcp"
+    assert "langfuse.session.id" in attrs
 
 
 async def test_call_tool_rejects_unknown_assistant(auth) -> None:

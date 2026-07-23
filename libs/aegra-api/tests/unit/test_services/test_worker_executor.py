@@ -1,6 +1,7 @@
 """Unit tests for worker_executor service."""
 
 import asyncio
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ from redis import TimeoutError as RedisTimeoutError
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
+from aegra_api.observability.span_enrichment import _run_trace_id
 from aegra_api.services.worker_executor import (
     WorkerExecutor,
     _acquire_and_load,
@@ -354,6 +356,15 @@ class TestRestoreTraceContext:
         assert call_kwargs["user_id"] == "test-user"
         assert call_kwargs["session_id"] == "11111111-2222-3333-4444-555555555555"
         assert call_kwargs["trace_name"] == "test-graph"
+
+    def test_sets_run_trace_id_from_run_id(self) -> None:
+        """The run's OTEL trace id is derived from run_id so it equals the trace
+        the downstream attaches scores/feedback to (LangSmith parity)."""
+        job = _make_run_job()
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        _run_trace_id.set(None)
+        _restore_trace_context(run_id, job, {"correlation_id": "req-abc"})
+        assert _run_trace_id.get() == uuid.UUID(run_id).int
 
     def test_clears_previous_context_before_setting_new(self) -> None:
         job = _make_run_job()

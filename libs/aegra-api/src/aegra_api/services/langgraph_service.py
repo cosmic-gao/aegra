@@ -25,10 +25,7 @@ from langgraph_sdk.auth.types import BaseUser
 
 from aegra_api.constants import ASSISTANT_NAMESPACE_UUID
 from aegra_api.models.auth import User
-from aegra_api.observability.base import (
-    get_tracing_callbacks,
-    get_tracing_metadata,
-)
+from aegra_api.observability.otel import otel_provider
 from aegra_api.services.graph_factory import (
     AccessContext,
     build_server_runtime,
@@ -735,22 +732,11 @@ def create_run_config(
     # Ensure the root run ID is set to match so that astream_events recognizes it
     cfg.setdefault("run_id", run_id)
 
-    # Add observability callbacks from various potential sources
-    tracing_callbacks = get_tracing_callbacks()
-    if tracing_callbacks:
-        existing_callbacks = cfg.get("callbacks", [])
-        if not isinstance(existing_callbacks, list):
-            # If we want to be more robust, we can log a warning here
-            existing_callbacks = []
-
-        # Combine existing callbacks with new tracing callbacks to be non-destructive
-        cfg["callbacks"] = existing_callbacks + tracing_callbacks
-
-    # Add metadata from all observability providers (independent of callbacks)
+    # Attach observability metadata. SpanEnrichmentProcessor also stamps these onto
+    # spans, but config metadata rides LangChain's config across thread hops.
     cfg.setdefault("metadata", {})
     user_identity = user.identity if user else None
-    observability_metadata = get_tracing_metadata(run_id, thread_id, user_identity)
-    cfg["metadata"].update(observability_metadata)
+    cfg["metadata"].update(otel_provider.get_metadata(run_id, thread_id, user_identity))
 
     # Apply checkpoint parameters if provided. Strip pinned identity keys so a
     # client checkpoint can't redirect execution to another user's thread.

@@ -50,6 +50,7 @@ from aegra_api import __version__
 from aegra_api.core.auth_deps import require_auth
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.auth import User
+from aegra_api.observability.span_enrichment import bind_run_trace_context
 from aegra_api.services.langgraph_service import get_langgraph_service
 
 logger = structlog.getLogger(__name__)
@@ -150,7 +151,17 @@ class AegraAgentExecutor(AgentExecutor):
         await updater.start_work()
 
         graph_input = {"messages": [{"role": "user", "content": context.get_user_input()}]}
-        config: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        thread_id = str(uuid4())
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        # Inline ainvoke bypasses the executor's trace setup, so bind here or the
+        # Langfuse trace lands without user/session/name enrichment.
+        bind_run_trace_context(
+            run_id=task.id,
+            thread_id=thread_id,
+            graph_id=graph_id,
+            user_identity=user.identity if user else None,
+            extra_metadata={"source": "a2a", "a2a_context_id": task.context_id},
+        )
         try:
             async with service.get_graph(graph_id, user=user) as graph:
                 result = await graph.ainvoke(graph_input, config)

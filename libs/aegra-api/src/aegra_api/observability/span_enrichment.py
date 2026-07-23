@@ -1,40 +1,28 @@
 """Per-request OTEL span enrichment via context variables.
 
-Sets Langfuse-compatible span attributes (``langfuse.user.id``,
-``langfuse.session.id``, ``langfuse.trace.name``) from per-request
-context variables on **every span** in the trace, enabling the Langfuse
-v4 immutable observations model where each observation must carry its
-own context (no server-side join from trace to children).
-
-Also sets Phoenix/OpenInference-compatible aliases (``user.id``,
-``session.id``) so that the same code works when ``OTEL_TARGETS``
-includes ``PHOENIX``.
-
-Usage::
-
-    # Inside the asyncio task that runs graph execution:
-    set_trace_context(
-        user_id=user.identity,
-        session_id=thread_id,
-        trace_name=graph_id,
-    )
-    # All OTEL spans created in this task will carry the attributes.
+Enriches *every* span (not just the root) with Langfuse (``langfuse.*``) and
+Phoenix/OpenInference (``user.id``, ``session.id``) attributes: the Langfuse v4
+immutable-observation model has no server-side trace->child join, so each
+observation must carry its own user/session/name.
 """
 
 import contextvars
+import hashlib
 import logging
+import uuid
 from typing import Any
 
 import structlog
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
+from opentelemetry.sdk.trace.id_generator import IdGenerator, RandomIdGenerator
 
 logger = logging.getLogger(__name__)
 
-# OTEL span attributes only accept primitive scalar types. The
-# observability SDK silently drops any other value at attribute-set
-# time, so we filter at this layer and emit an aegra-level warning
-# instead of letting drops happen invisibly inside the SDK.
+# OTEL accepts only these; the SDK silently drops other types, so we filter
+# here and warn instead of letting drops happen invisibly.
 _PRIMITIVE_ATTR_TYPES: tuple[type, ...] = (str, int, float, bool)
 
 # Per-request context variable holding span attributes to inject.
@@ -43,20 +31,40 @@ _trace_attrs: contextvars.ContextVar[dict[str, str | int | float | bool] | None]
     "aegra_otel_trace_attrs", default=None
 )
 
+# Per-request OTEL trace id derived from run_id — LangSmith parity: a trace is
+# identified by its run, so downstream attaches scores/feedback by run_id.
+_run_trace_id: contextvars.ContextVar[int | None] = contextvars.ContextVar("aegra_otel_run_trace_id", default=None)
+
+
+def trace_id_from_run(run_id: str) -> int | None:
+    """Map run_id to a 128-bit OTEL trace id.
+
+    UUID run_ids map 1:1 (trace hex == run_id without dashes); other ids hash to
+    128 bits. Returns None for a 0 result — 0 is an invalid OTEL trace id.
+    """
+    try:
+        derived = uuid.UUID(run_id).int
+    except ValueError:
+        derived = int.from_bytes(hashlib.blake2b(run_id.encode(), digest_size=16).digest(), "big")
+    return derived or None
+
+
+class RunIdGenerator(IdGenerator):
+    """Forces the run root span's trace id to :func:`trace_id_from_run` when a run
+    context is active, random otherwise. Span ids stay random."""
+
+    def __init__(self) -> None:
+        self._fallback = RandomIdGenerator()
+
+    def generate_span_id(self) -> int:
+        return self._fallback.generate_span_id()
+
+    def generate_trace_id(self) -> int:
+        return _run_trace_id.get() or self._fallback.generate_trace_id()
+
 
 class SpanEnrichmentProcessor(SpanProcessor):
-    """Injects per-request trace attributes onto every span in the trace.
-
-    Reads from the ``aegra_otel_trace_attrs`` context variable and sets
-    each key/value pair as a span attribute on **all spans** (root, child,
-    and grandchild).  The Langfuse v4 immutable observations model requires
-    each observation to carry its own userId, sessionId, and traceName — there
-    is no server-side join from trace to children.
-
-    Call :func:`set_trace_context` inside the asyncio Task that runs
-    graph execution to populate the context variable before any spans
-    are created.
-    """
+    """Sets the per-request ``_trace_attrs`` on every span in ``on_start``."""
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
         attrs = _trace_attrs.get()
@@ -82,32 +90,12 @@ def set_trace_context(
     trace_name: str | None = None,
     metadata: dict[str, str | int | float | bool] | None = None,
 ) -> None:
-    """Populate the per-request OTEL span attributes context variable.
+    """Populate the per-request span-attribute context variable.
 
-    Must be called inside the asyncio Task that will run graph execution.
-    The root OTEL span created in this task will have the specified
-    attributes injected by :class:`SpanEnrichmentProcessor`.
-
-    Sets Langfuse-native attributes (``langfuse.*``) and their
-    Phoenix/OpenInference aliases (``user.id``, ``session.id``) so a
-    single call works regardless of which backend is configured in
-    ``OTEL_TARGETS``.
-
-    Args:
-        user_id: User identity string.  Sets ``langfuse.user.id``
-            (Langfuse) and ``user.id`` (Phoenix).  Natively filterable
-            in both backends as a first-class field.
-        session_id: Session identifier (typically ``thread_id``).  Sets
-            ``langfuse.session.id`` (Langfuse) and ``session.id``
-            (Phoenix).
-        trace_name: Human-readable trace name (typically the graph ID).
-            Sets ``langfuse.trace.name``.
-        metadata: Arbitrary key/value pairs to attach as filterable
-            metadata.  Each key is stored as
-            ``langfuse.trace.metadata.<key>`` so that Langfuse exposes
-            it as a queryable field rather than burying it under
-            ``metadata.attributes``.  Values may be ``str``, ``int``,
-            ``float``, or ``bool`` — all valid OTEL attribute types.
+    Must run inside the task/context that executes the graph. Sets Langfuse
+    (``langfuse.*``) and Phoenix (``user.id``/``session.id``) aliases so one
+    call works for either backend; ``metadata`` lands under
+    ``langfuse.trace.metadata.<key>`` to stay queryable as a trace field.
     """
     attrs: dict[str, str | int | float | bool] = {}
     if user_id:
@@ -128,21 +116,10 @@ def merge_run_metadata(
     extra_metadata: dict[str, Any] | None,
     system_metadata: dict[str, str | int | float | bool],
 ) -> dict[str, str | int | float | bool]:
-    """Merge user-supplied metadata with system-injected runtime keys.
+    """Merge user metadata with system runtime keys; system wins on collision.
 
-    Any key already present in ``system_metadata`` (currently
-    ``run_id``, ``thread_id``, ``graph_id``, and ``original_request_id``
-    on the worker path) wins on collision: the system value is kept and
-    a warning is logged so the override is visible during debugging
-    without breaking the request. ``system_metadata`` is the single
-    source of truth for "what the runtime owns" — there is no separate
-    reserved-key registry to drift out of sync with caller behavior.
-
-    Non-primitive values (anything other than ``str``, ``int``, ``float``,
-    ``bool``) are dropped with a warning. OTEL span attributes accept
-    only primitives; passing a nested dict or list to ``span.set_attribute``
-    is a silent no-op at the SDK level. Filtering here surfaces the drop
-    with the offending key so callers can fix the payload upstream.
+    Collisions and non-primitive values (OTEL accepts str/int/float/bool only)
+    are skipped with a warning so the rejected key is visible upstream.
     """
     if not extra_metadata:
         return dict(system_metadata)
@@ -167,6 +144,58 @@ def merge_run_metadata(
     return merged
 
 
+def bind_run_trace_id(run_id: str) -> None:
+    """Set the run's derived trace id on the current context so its root span
+    adopts it (see :class:`RunIdGenerator`). Worker + inline paths both call this."""
+    _run_trace_id.set(trace_id_from_run(run_id))
+
+
+def _detach_ambient_span() -> None:
+    """Drop any ambient OTEL span so the run's first span is a true root and the
+    trace id comes from :class:`RunIdGenerator`, not parent inheritance. Needed
+    where a run executes inside a request span — LocalExecutor's copied context
+    and the A2A/MCP inline paths."""
+    otel_context.attach(otel_trace.set_span_in_context(otel_trace.INVALID_SPAN))
+
+
+def bind_run_trace_context(
+    *,
+    run_id: str,
+    thread_id: str,
+    graph_id: str,
+    user_identity: str | None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Bind span-enrichment + structlog + run trace id into the CURRENT context,
+    rooting the trace so its id is :func:`trace_id_from_run`.
+
+    For inline ``ainvoke``/``astream`` paths (A2A, MCP) that skip the executor's
+    task-based setup (cf. :func:`make_run_trace_context`). System keys win over
+    ``extra_metadata``; ``user_id`` is bound only when present.
+    """
+    system_metadata: dict[str, str | int | float | bool] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+    }
+    set_trace_context(
+        user_id=user_identity,
+        session_id=thread_id,
+        trace_name=graph_id,
+        metadata=merge_run_metadata(extra_metadata, system_metadata),
+    )
+    bind_run_trace_id(run_id)
+    _detach_ambient_span()
+    structlog_bindings: dict[str, str] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+    }
+    if user_identity is not None:
+        structlog_bindings["user_id"] = user_identity
+    structlog.contextvars.bind_contextvars(**structlog_bindings)
+
+
 def make_run_trace_context(
     run_id: str,
     thread_id: str,
@@ -175,46 +204,21 @@ def make_run_trace_context(
     *,
     extra_metadata: dict[str, Any] | None = None,
 ) -> contextvars.Context:
-    """Return an isolated context copy with trace context pre-set for a run.
+    """Return an isolated context copy with trace context pre-set.
 
-    Creates a copy of the current context and populates it with both the
-    per-request OTEL span attributes and the structlog context vars
-    (``run_id``, ``thread_id``, ``graph_id``, ``user_id``).  Pass the
-    returned context to ``asyncio.create_task(..., context=ctx)`` so the
-    background task starts with the correct trace data and every log line
-    it emits carries the run identifiers automatically — mirroring the
-    worker path's ``_restore_trace_context``.
-
-    User-supplied ``extra_metadata`` is merged with the system runtime keys
-    (``run_id``, ``thread_id``, ``graph_id``) for the OTEL attributes.
-    System keys win on collision — see :func:`merge_run_metadata`.
+    Pass to ``asyncio.create_task(..., context=ctx)`` so the background task's
+    spans and logs carry the run identifiers — mirrors the worker path's
+    ``_restore_trace_context``. Delegates the binding to
+    :func:`bind_run_trace_context`.
     """
-    system_metadata: dict[str, str | int | float | bool] = {
-        "run_id": run_id,
-        "thread_id": thread_id,
-        "graph_id": graph_id,
-    }
-    metadata = merge_run_metadata(extra_metadata, system_metadata)
+    # ``ctx.run`` so the binding lands in the returned context, not the caller's.
     ctx = contextvars.copy_context()
     ctx.run(
-        set_trace_context,
-        user_id=user_identity,
-        session_id=thread_id,
-        trace_name=graph_id,
-        metadata=metadata,
+        bind_run_trace_context,
+        run_id=run_id,
+        thread_id=thread_id,
+        graph_id=graph_id,
+        user_identity=user_identity,
+        extra_metadata=extra_metadata,
     )
-    # Bind structlog context vars inside the same isolated context so
-    # background-task logs include the run identifiers. Run via ``ctx.run``
-    # so the binding lands in the returned context, not the caller's.
-    # ``user_id`` is only bound when present, matching the OTEL path above
-    # (``set_trace_context`` guards on truthy ``user_id``) — anonymous runs
-    # omit the key rather than logging ``user_id=None``.
-    structlog_bindings: dict[str, str] = {
-        "run_id": run_id,
-        "thread_id": thread_id,
-        "graph_id": graph_id,
-    }
-    if user_identity is not None:
-        structlog_bindings["user_id"] = user_identity
-    ctx.run(structlog.contextvars.bind_contextvars, **structlog_bindings)
     return ctx

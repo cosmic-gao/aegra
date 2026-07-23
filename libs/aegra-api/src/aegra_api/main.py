@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute, APIRouter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from aegra_api import __version__
 from aegra_api.api.assistants import router as assistants_router
@@ -35,6 +36,7 @@ from aegra_api.core.route_merger import (
 from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
+from aegra_api.observability.otel import otel_provider
 from aegra_api.observability.setup import setup_observability
 from aegra_api.services.a2a_server import a2a_routes
 from aegra_api.services.broker import broker_manager
@@ -377,6 +379,15 @@ def _mcp_enabled() -> bool:
     return not (http_config and http_config.get("disable_mcp", False))
 
 
+def _instrument_fastapi(app: FastAPI) -> None:
+    """Add OTEL HTTP server spans for every route (core, custom, mounted) when
+    tracing is enabled. Excludes health/metrics to avoid span spam. The tracer
+    provider is set later in lifespan; OTEL's proxy forwards spans once it is."""
+    if not otel_provider.is_enabled():
+        return
+    FastAPIInstrumentor.instrument_app(app, excluded_urls="health,metrics")
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -439,6 +450,7 @@ def create_app() -> FastAPI:
 
         application.get("/")(root_handler)
 
+    _instrument_fastapi(application)
     setup_prometheus_metrics(application)
 
     return application

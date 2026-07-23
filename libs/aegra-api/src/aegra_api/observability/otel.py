@@ -8,12 +8,12 @@ from typing import Any
 
 from openinference.instrumentation.langchain import LangChainInstrumentor
 from opentelemetry import trace
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-from aegra_api.observability.base import ObservabilityProvider
-from aegra_api.observability.span_enrichment import SpanEnrichmentProcessor
+from aegra_api.observability.span_enrichment import RunIdGenerator, SpanEnrichmentProcessor
 from aegra_api.observability.targets import (
     BaseOtelTarget,
     GenericOtelTarget,
@@ -25,16 +25,13 @@ from aegra_api.settings import settings
 logger = logging.getLogger(__name__)
 
 
-class OpenTelemetryProvider(ObservabilityProvider):
-    """
-    Main provider that configures the global OpenTelemetry Tracer.
-    """
+class OpenTelemetryProvider:
+    """Configures the global OpenTelemetry tracer and fans out to targets."""
 
     def __init__(self) -> None:
         self._enabled = False
         self._tracer_provider: TracerProvider | None = None
 
-        # Defining the list of active targets
         self._active_targets: list[BaseOtelTarget] = self._resolve_targets()
         self._has_langfuse = any(isinstance(target, LangfuseTarget) for target in self._active_targets)
 
@@ -88,7 +85,6 @@ class OpenTelemetryProvider(ObservabilityProvider):
         if self._tracer_provider:
             return
 
-        # 1. Resource
         resource = Resource.create(
             attributes={
                 "service.name": settings.observability.OTEL_SERVICE_NAME,
@@ -97,11 +93,10 @@ class OpenTelemetryProvider(ObservabilityProvider):
             }
         )
 
-        self._tracer_provider = TracerProvider(resource=resource)
+        self._tracer_provider = TracerProvider(resource=resource, id_generator=RunIdGenerator())
         self._tracer_provider.add_span_processor(SpanEnrichmentProcessor())
         processors_count = 0
 
-        # 2. Attach Exporters
         for target in self._active_targets:
             try:
                 exporter = target.get_exporter()
@@ -113,22 +108,16 @@ class OpenTelemetryProvider(ObservabilityProvider):
             except Exception as e:
                 logger.error(f"Observability: Failed to attach target '{target.name}': {e}")
 
-        # 3. Console Exporter
         if settings.observability.OTEL_CONSOLE_EXPORT:
             self._tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
             processors_count += 1
             logger.info("Observability: Console export enabled")
 
-        # 4. Set Global Tracer & Instrument
         if processors_count > 0:
             trace.set_tracer_provider(self._tracer_provider)
             LangChainInstrumentor().instrument(tracer_provider=self._tracer_provider)
-            logger.info("Observability: Auto-instrumentation enabled")
-
-    def get_callbacks(self) -> list[Any]:
-        if self.is_enabled():
-            self.setup()
-        return []
+            HTTPXClientInstrumentor().instrument(tracer_provider=self._tracer_provider)
+            logger.info("Observability: Auto-instrumentation enabled (LangChain + HTTPX)")
 
     def get_metadata(self, run_id: str, thread_id: str, user_identity: str | None = None) -> dict[str, Any]:
         if not self.is_enabled():

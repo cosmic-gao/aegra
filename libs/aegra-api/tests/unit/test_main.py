@@ -5,41 +5,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aegra_api.observability.base import get_observability_manager
-
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_lifespan_registers_otel_provider(monkeypatch):
-    """Test that the lifespan function registers the OpenTelemetry provider during startup."""
-    # Configure OTEL_TARGETS so the provider is enabled
-    monkeypatch.setenv("OTEL_TARGETS", "LANGFUSE")
-
-    # 1. Reload settings
-    import aegra_api.settings as settings_module
-
-    importlib.reload(settings_module)
-
-    # 2. Reload otel module (creates new Provider class/instance)
-    import aegra_api.observability.otel as otel_module
-
-    importlib.reload(otel_module)
-    # 3. Reload setup module (crucial! so it imports the NEW otel_provider)
-    import aegra_api.observability.setup as setup_module
-    from aegra_api.observability.otel import OpenTelemetryProvider
-
-    importlib.reload(setup_module)
-
-    # 4. Reload main module
+async def test_lifespan_sets_up_observability():
+    """Test that the lifespan function initializes observability during startup."""
     import aegra_api.main as main_module
 
     importlib.reload(main_module)
 
-    # Mock all the dependencies
     with (
         patch("aegra_api.main.run_migrations_async", new_callable=AsyncMock),
         patch("aegra_api.main.db_manager") as mock_db_manager,
         patch("aegra_api.main.get_langgraph_service") as mock_get_langgraph_service,
+        patch("aegra_api.main.setup_observability") as mock_setup_observability,
     ):
         mock_db_manager.initialize = AsyncMock()
         mock_db_manager.close = AsyncMock()
@@ -48,17 +27,12 @@ async def test_lifespan_registers_otel_provider(monkeypatch):
         mock_langgraph_service.initialize = AsyncMock()
         mock_get_langgraph_service.return_value = mock_langgraph_service
 
-        # Clear the manager
-        manager = get_observability_manager()
-        manager._providers.clear()
-
         mock_app = MagicMock()
 
         async with main_module.lifespan(mock_app):
-            # Verify OpenTelemetryProvider is registered
-            otel_providers = [p for p in manager._providers if isinstance(p, OpenTelemetryProvider)]
-            assert len(otel_providers) == 1, "OpenTelemetry provider should be registered during lifespan startup"
+            pass
 
+        mock_setup_observability.assert_called_once()
         mock_db_manager.close.assert_called_once()
 
 
@@ -164,3 +138,33 @@ async def test_lifespan_runs_migrations_when_enabled(monkeypatch):
             pass
 
         mock_migrations.assert_called_once()
+
+
+@pytest.mark.unit
+def test_instrument_fastapi_skips_when_observability_disabled():
+    """No HTTP server-span instrumentation when tracing is off (avoids overhead)."""
+    import aegra_api.main as main_module
+
+    with (
+        patch.object(main_module.otel_provider, "is_enabled", return_value=False),
+        patch.object(main_module, "FastAPIInstrumentor") as mock_instrumentor,
+    ):
+        main_module._instrument_fastapi(MagicMock())
+
+    mock_instrumentor.instrument_app.assert_not_called()
+
+
+@pytest.mark.unit
+def test_instrument_fastapi_wraps_app_when_observability_enabled():
+    """The app is instrumented for HTTP server spans when tracing is on."""
+    import aegra_api.main as main_module
+
+    app = MagicMock()
+    with (
+        patch.object(main_module.otel_provider, "is_enabled", return_value=True),
+        patch.object(main_module, "FastAPIInstrumentor") as mock_instrumentor,
+    ):
+        main_module._instrument_fastapi(app)
+
+    mock_instrumentor.instrument_app.assert_called_once()
+    assert mock_instrumentor.instrument_app.call_args.args[0] is app

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aegra_api.observability.otel import OpenTelemetryProvider
+from aegra_api.observability.span_enrichment import RunIdGenerator
 from aegra_api.observability.targets import (
     BaseOtelTarget,
     GenericOtelTarget,
@@ -128,6 +129,7 @@ class TestOpenTelemetryProviderSetup:
             patch("aegra_api.observability.otel.BatchSpanProcessor") as mock_bsp,
             patch("aegra_api.observability.otel.ConsoleSpanExporter") as mock_cse,
             patch("aegra_api.observability.otel.LangChainInstrumentor") as mock_lci,
+            patch("aegra_api.observability.otel.HTTPXClientInstrumentor") as mock_hci,
             patch("aegra_api.observability.otel.trace") as mock_trace,
             patch("aegra_api.observability.otel.Resource") as mock_resource,
             patch("aegra_api.observability.otel.settings") as mock_settings,
@@ -143,6 +145,7 @@ class TestOpenTelemetryProviderSetup:
                 "bsp": mock_bsp,
                 "cse": mock_cse,
                 "lci": mock_lci,
+                "hci": mock_hci,
                 "trace": mock_trace,
                 "resource": mock_resource,
                 "settings": mock_settings,
@@ -179,7 +182,9 @@ class TestOpenTelemetryProviderSetup:
                 "deployment.environment": "test",
             }
         )
-        mock_deps["tp"].assert_called_with(resource=mock_deps["resource"].create.return_value)
+        _, tp_kwargs = mock_deps["tp"].call_args
+        assert tp_kwargs["resource"] is mock_deps["resource"].create.return_value
+        assert isinstance(tp_kwargs["id_generator"], RunIdGenerator)
 
     def test_setup_attaches_configured_targets(self, mock_deps):
         """Test that exporters from targets are attached to the tracer."""
@@ -244,25 +249,11 @@ class TestOpenTelemetryProviderSetup:
         mock_deps["trace"].set_tracer_provider.assert_called_with(mock_deps["tp"].return_value)
 
         mock_deps["lci"].return_value.instrument.assert_called_with(tracer_provider=mock_deps["tp"].return_value)
+        mock_deps["hci"].return_value.instrument.assert_called_with(tracer_provider=mock_deps["tp"].return_value)
 
 
 class TestOpenTelemetryProviderRuntime:
-    """Tests for runtime methods (get_callbacks, get_metadata)."""
-
-    def test_get_callbacks_triggers_setup(self):
-        """Test that get_callbacks calls setup if enabled."""
-        with patch("aegra_api.observability.otel.settings") as mock_settings:
-            mock_settings.observability.OTEL_CONSOLE_EXPORT = True
-
-            provider = OpenTelemetryProvider()
-
-            # Mock setup to verify it's called
-            provider.setup = MagicMock()
-
-            callbacks = provider.get_callbacks()
-
-            assert callbacks == []
-            provider.setup.assert_called_once()
+    """Tests for runtime methods (get_metadata)."""
 
     def test_get_metadata_returns_correct_structure(self):
         """Test metadata generation when enabled."""

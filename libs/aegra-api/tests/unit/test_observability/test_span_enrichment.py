@@ -1,11 +1,15 @@
 """Unit tests for SpanEnrichmentProcessor and set_trace_context."""
 
 import asyncio
+import contextvars
 import logging
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
 import structlog
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -13,11 +17,16 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 
 from aegra_api.observability.span_enrichment import (
+    RunIdGenerator,
     SpanEnrichmentProcessor,
+    _run_trace_id,
     _trace_attrs,
+    bind_run_trace_context,
+    bind_run_trace_id,
     make_run_trace_context,
     merge_run_metadata,
     set_trace_context,
+    trace_id_from_run,
 )
 
 
@@ -304,6 +313,170 @@ class TestMakeRunTraceContext:
         assert bound["run_id"] == "run-1"
         assert bound["thread_id"] == "thread-1"
         assert bound["graph_id"] == "my_graph"
+
+
+class TestBindRunTraceContext:
+    """Tests for bind_run_trace_context() — binds the CURRENT context (A2A/MCP path)."""
+
+    def setup_method(self) -> None:
+        """Reset context vars before each test."""
+        _trace_attrs.set(None)
+        _run_trace_id.set(None)
+        structlog.contextvars.clear_contextvars()
+
+    def teardown_method(self) -> None:
+        """Clear structlog bindings so they don't bleed into later tests."""
+        _run_trace_id.set(None)
+        structlog.contextvars.clear_contextvars()
+
+    def test_sets_otel_attrs_in_current_context(self) -> None:
+        """OTEL span attrs are set on the caller's own context (no copy)."""
+        bind_run_trace_context(
+            run_id="run-1",
+            thread_id="thread-1",
+            graph_id="my_graph",
+            user_identity="user-1",
+        )
+
+        attrs = _trace_attrs.get()
+        assert attrs["langfuse.user.id"] == "user-1"
+        assert attrs["langfuse.session.id"] == "thread-1"
+        assert attrs["langfuse.trace.name"] == "my_graph"
+        assert attrs["langfuse.trace.metadata.run_id"] == "run-1"
+        assert attrs["langfuse.trace.metadata.thread_id"] == "thread-1"
+        assert attrs["langfuse.trace.metadata.graph_id"] == "my_graph"
+
+    def test_binds_structlog_vars(self) -> None:
+        """Run identifiers are bound in the current context for log correlation."""
+        bind_run_trace_context(
+            run_id="run-1",
+            thread_id="thread-1",
+            graph_id="my_graph",
+            user_identity="user-1",
+        )
+
+        bound = structlog.contextvars.get_contextvars()
+        assert bound["run_id"] == "run-1"
+        assert bound["thread_id"] == "thread-1"
+        assert bound["graph_id"] == "my_graph"
+        assert bound["user_id"] == "user-1"
+
+    def test_anonymous_user_omits_user_keys(self) -> None:
+        """user_identity=None omits user id from both OTEL attrs and structlog."""
+        bind_run_trace_context(
+            run_id="run-1",
+            thread_id="thread-1",
+            graph_id="my_graph",
+            user_identity=None,
+        )
+
+        attrs = _trace_attrs.get()
+        assert "langfuse.user.id" not in attrs
+        assert "user.id" not in attrs
+        assert "user_id" not in structlog.contextvars.get_contextvars()
+
+    def test_extra_metadata_merged_and_system_keys_win(self) -> None:
+        """extra_metadata rides alongside system keys; system wins on collision."""
+        bind_run_trace_context(
+            run_id="run-actual",
+            thread_id="thread-1",
+            graph_id="my_graph",
+            user_identity="user-1",
+            extra_metadata={"source": "a2a", "run_id": "spoofed"},
+        )
+
+        attrs = _trace_attrs.get()
+        assert attrs["langfuse.trace.metadata.source"] == "a2a"
+        assert attrs["langfuse.trace.metadata.run_id"] == "run-actual"
+
+    def test_binds_run_trace_id_from_run(self) -> None:
+        """The run's OTEL trace id is derived from run_id (LangSmith parity)."""
+        run_id = str(uuid.uuid4())
+        bind_run_trace_context(run_id=run_id, thread_id="t1", graph_id="g", user_identity="u1")
+        assert _run_trace_id.get() == uuid.UUID(run_id).int
+
+    def test_run_root_uses_derived_trace_id_even_under_ambient_span(self) -> None:
+        """Even under an ambient request span (LocalExecutor copies the request
+        context), the run's first span is a true root whose trace id == run_id."""
+        run_id = str(uuid.uuid4())
+        tracer = TracerProvider(id_generator=RunIdGenerator()).get_tracer("test")
+        result: dict[str, object] = {}
+
+        def _under_ambient() -> None:
+            # Attach an ambient span the way an ASGI server span would be present,
+            # then bind: the run span must still start its own trace.
+            otel_context.attach(otel_trace.set_span_in_context(tracer.start_span("http-request")))
+            bind_run_trace_context(run_id=run_id, thread_id="t1", graph_id="g", user_identity="u1")
+            with tracer.start_as_current_span("run-root") as span:
+                result["trace_id"] = format(span.get_span_context().trace_id, "032x")
+                result["parent"] = span.parent
+
+        contextvars.copy_context().run(_under_ambient)
+        assert result["trace_id"] == run_id.replace("-", "")
+        assert result["parent"] is None
+
+
+class TestTraceIdFromRun:
+    """Tests for trace_id_from_run() — run_id → 128-bit OTEL trace id."""
+
+    def test_uuid_run_id_maps_one_to_one(self) -> None:
+        """A UUID run_id maps to its own 128 bits: trace hex == run_id without dashes."""
+        run_id = str(uuid.uuid4())
+        tid = trace_id_from_run(run_id)
+        assert tid == uuid.UUID(run_id).int
+        assert format(tid, "032x") == run_id.replace("-", "")
+
+    def test_non_uuid_run_id_is_deterministic_and_bounded(self) -> None:
+        """A non-UUID run_id (e.g. a client A2A task id) hashes deterministically
+        into the valid 128-bit range."""
+        first = trace_id_from_run("task-abc")
+        assert first == trace_id_from_run("task-abc")
+        assert 0 < first < (1 << 128)
+
+    def test_zero_uuid_returns_none(self) -> None:
+        """The all-zero UUID would yield trace id 0, which is invalid in OTEL."""
+        assert trace_id_from_run("00000000-0000-0000-0000-000000000000") is None
+
+
+class TestRunIdGenerator:
+    """Tests for RunIdGenerator — forces the run trace id when a run is active."""
+
+    def setup_method(self) -> None:
+        _run_trace_id.set(None)
+
+    def teardown_method(self) -> None:
+        _run_trace_id.set(None)
+
+    def test_uses_run_trace_id_when_set(self) -> None:
+        _run_trace_id.set(12345)
+        assert RunIdGenerator().generate_trace_id() == 12345
+
+    def test_falls_back_to_random_when_unset(self) -> None:
+        gen = RunIdGenerator()
+        first, second = gen.generate_trace_id(), gen.generate_trace_id()
+        assert first != second
+        assert 0 < first < (1 << 128)
+
+    def test_span_ids_are_random_and_valid(self) -> None:
+        gen = RunIdGenerator()
+        first, second = gen.generate_span_id(), gen.generate_span_id()
+        assert first != second
+        assert 0 < first < (1 << 64)
+
+
+class TestBindRunTraceId:
+    """Tests for bind_run_trace_id() — used by the worker restore path."""
+
+    def setup_method(self) -> None:
+        _run_trace_id.set(None)
+
+    def teardown_method(self) -> None:
+        _run_trace_id.set(None)
+
+    def test_sets_derived_trace_id(self) -> None:
+        run_id = str(uuid.uuid4())
+        bind_run_trace_id(run_id)
+        assert _run_trace_id.get() == uuid.UUID(run_id).int
 
 
 class TestMergeRunMetadata:

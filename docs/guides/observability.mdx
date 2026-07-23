@@ -90,11 +90,31 @@ Each backend receives the same trace data through separate `BatchSpanProcessor` 
 
 Aegra uses a pure OpenTelemetry approach:
 
-1. **Auto-instrumentation** captures LangGraph steps automatically using `openinference-instrumentation-langchain`
+1. **Auto-instrumentation** captures the whole request path — LangGraph steps (`openinference-instrumentation-langchain`), HTTP server spans for every route including your custom routes (`opentelemetry-instrumentation-fastapi`), and outbound HTTP client calls with W3C `traceparent` propagation to downstream services such as sandboxes and tool servers (`opentelemetry-instrumentation-httpx`)
 2. **Singleton provider** is initialized once during application startup
 3. **Fan-out** sends the same trace data to all configured exporters via `BatchSpanProcessor`
 
-This keeps overhead low and maintains compatibility with the entire OpenTelemetry ecosystem.
+This keeps overhead low and maintains compatibility with the entire OpenTelemetry ecosystem. All auto-instrumentation is enabled only when at least one target (or console export) is configured.
+
+### Trace identity
+
+A run's trace id **equals its `run_id`**: the 128-bit OTEL trace id is the run's UUID, so the 32-hex trace id in Langfuse is simply the `run_id` with its dashes removed. This mirrors LangGraph Platform / LangSmith, where a trace is identified by its root run.
+
+Because the mapping is deterministic, any service holding the `run_id` (returned by the run API) can compute the trace id with no lookup — the recommended way to attach scores, evaluations, or user feedback to a run's trace after it finishes:
+
+```python
+trace_id = run_id.replace("-", "")   # 32-hex OTEL trace id for the run
+```
+
+A non-UUID run id (for example a client-supplied A2A task id) is hashed deterministically into a 128-bit trace id instead.
+
+### Execution surfaces
+
+Every way a graph can run is enriched identically — the run's root span and all of its child observations carry `langfuse.user.id`, `langfuse.session.id`, and `langfuse.trace.name` (the graph id), so filtering by assistant in Langfuse surfaces every invocation regardless of entry point:
+
+- **Runs API** — `POST /threads/{thread_id}/runs`, `/runs/stream`, `/runs/wait`, plus cron- and delayed-run–triggered runs
+- **A2A** — `/a2a/{assistant_id}`; traces are tagged `source=a2a`
+- **MCP** — `/mcp` (one tool per graph); traces are tagged `source=mcp`
 
 ## Run metadata
 

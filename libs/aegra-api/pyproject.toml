@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.11.0"
+version = "0.11.2"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -38,6 +38,10 @@ dependencies = [
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
     "openinference-instrumentation-langchain>=0.1.58",
+    # Full-stack tracing: HTTP server spans for all routes + client spans with
+    # W3C traceparent propagation to the sandbox / tool servers.
+    "opentelemetry-instrumentation-fastapi>=0.60b1",
+    "opentelemetry-instrumentation-httpx>=0.60b1",
     # Metrics
     # >=8.0.2: 7.x reads route.path on FastAPI >=0.137's _IncludedRouter (which has
     # no .path), 500ing every request when metrics are on. 8.0.2 handles the new tree.
