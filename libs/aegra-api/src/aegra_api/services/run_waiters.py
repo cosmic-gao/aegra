@@ -16,23 +16,27 @@ from sqlalchemy import select
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
+from aegra_api.models.enums import TERMINAL_RUN_STATUSES
 from aegra_api.services.executor import executor
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
 
-# Terminal run states — used by join/wait to skip waiting
-TERMINAL_STATES = {"success", "error", "interrupted"}
+# Terminal run states — used by join/wait to skip waiting. Aliased to the
+# canonical set so a new terminal status can't silently hang the waiters.
+TERMINAL_STATES = TERMINAL_RUN_STATUSES
 
 
 def wrap_run_result(status: str, output: dict[str, Any] | None, error_message: str | None) -> dict[str, Any]:
     """Shape a terminal run's payload for the non-streaming wait/join response.
 
-    On error, emit the SDK's in-band ``{"__error__": {...}}`` envelope so
-    ``client.runs.wait(raise_error=True)`` raises instead of returning silently.
+    On error or timeout, emit the SDK's in-band ``{"__error__": {...}}`` envelope
+    so ``client.runs.wait(raise_error=True)`` raises instead of returning silently.
     """
     if status == "error":
         return {"__error__": {"error": "error", "message": error_message or "Run failed"}}
+    if status == "timeout":
+        return {"__error__": {"error": "timeout", "message": error_message or "Run timed out"}}
     return output or {}
 
 

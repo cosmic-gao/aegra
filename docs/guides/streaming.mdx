@@ -285,7 +285,7 @@ curl -X POST http://localhost:8000/threads/$THREAD/commands \
 
 ### Streaming events
 
-The SSE filter is a POST body listing the channels you want — no run id. Pass `since` (the last `seq` you saw) to resume after a dropped connection.
+The SSE filter is a POST body listing the channels you want — no run id. Pass `since` (the last `seq` you saw) to resume after a dropped connection. If `since` is omitted, the `Last-Event-ID` header is honored instead, so a browser `EventSource` auto-reconnect resumes without extra client code.
 
 ```bash
 curl -N -X POST http://localhost:8000/threads/$THREAD/stream/events \

@@ -146,7 +146,7 @@ The `ctx` parameter provides:
 
 - `ctx.user` — Authenticated user object (with all fields you returned from `authenticate`)
 - `ctx.resource` — Resource name (`"threads"`, `"assistants"`, etc.)
-- `ctx.action` — Action name (`"create"`, `"read"`, `"update"`, `"delete"`, `"search"`)
+- `ctx.action` — Action name (`"create"`, `"read"`, `"update"`, `"delete"`, `"search"`, `"create_run"`)
 - `ctx.permissions` — User permissions list
 
 ### Return values
@@ -157,6 +157,26 @@ The `ctx` parameter provides:
 | `False` | Deny with 403 Forbidden |
 | `dict` | Allow with filters (e.g., `{"metadata": {"team_id": "123"}}`) |
 | Modified `value` | Allow with modified request data |
+
+### Authorizing run execution (`create_run`)
+
+The `threads.create_run` action governs **starting a graph run**. It is dispatched by **every
+run-creation entrypoint**, so an operator's policy applies uniformly and can't be sidestepped
+by choosing a different route: the REST create/stream/wait endpoints
+(`POST /threads/{thread_id}/runs`, `/runs/stream`, `/runs/wait`), their stateless equivalents
+(`POST /runs`, `/runs/stream`, `/runs/wait`, `/runs/batch`), and the inline A2A JSON-RPC
+(`/a2a/{assistant_id}`) and MCP tool (`/mcp`) surfaces — all applying the same handler, not
+just authentication. A denying handler returns 403; a handler returning a `config`/`context`
+filter has it merged into that run.
+
+```python
+@auth.on.threads.create_run
+async def scope_runs(ctx, value):
+    if not ctx.user.can_run:
+        return False
+    # Inject per-user config that reaches the graph on REST, A2A, and MCP
+    return {"config": {"configurable": {"team_id": ctx.user.team_id}}}
+```
 
 ## Accessing user data in your graph
 

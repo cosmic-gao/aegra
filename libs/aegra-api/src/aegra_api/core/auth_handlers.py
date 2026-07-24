@@ -246,3 +246,29 @@ def build_auth_context(
         resource=resource,
         action=action,
     )
+
+
+def merge_auth_filters(
+    config: dict[str, Any],
+    context: dict[str, Any],
+    filters: dict[str, Any] | None,
+    value: dict[str, Any],
+) -> None:
+    """Merge an ``@auth.on`` handler's config/context into an inline execution config.
+
+    For the A2A/MCP paths that build an execution ``config`` dict (rather than a
+    ``RunCreate``): use the returned filter dict when the handler produced one, else
+    the ``value`` it mutated in place. The server ``thread_id`` stays authoritative if
+    a handler replaced ``configurable``.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id")
+    source = filters if filters else value
+    handler_config = source.get("config")
+    if isinstance(handler_config, dict):
+        config.update(handler_config)
+    handler_context = source.get("context")
+    if isinstance(handler_context, dict):
+        context.update(handler_context)
+    configurable = config.setdefault("configurable", {})
+    if isinstance(configurable, dict) and thread_id is not None:
+        configurable["thread_id"] = thread_id

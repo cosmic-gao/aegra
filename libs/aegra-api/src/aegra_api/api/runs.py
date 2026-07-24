@@ -44,6 +44,27 @@ logger = structlog.getLogger(__name__)
 DEFAULT_STREAM_MODES = ["values"]
 
 
+async def _authorize_run_creation(user: User, request: RunCreate, thread_id: str) -> None:
+    """Dispatch the ``threads.create_run`` @auth.on event and merge handler filters.
+
+    Deny raises 403 before the run is created; allow may inject config/context. Used
+    by every run-creation entrypoint — create, stream, wait (and the stateless
+    wrappers that delegate to them) — so an operator's authorization policy applies
+    uniformly, not just on the plain create path.
+    """
+    ctx = build_auth_context(user, "threads", "create_run")
+    value = {**request.model_dump(), "thread_id": thread_id}
+    filters = await handle_event(ctx, value)
+    # Handler returned a filter dict, else the value it mutated in place.
+    source = filters if filters else value
+    handler_config = source.get("config")
+    if isinstance(handler_config, dict):
+        request.config = {**(request.config or {}), **handler_config}
+    handler_context = source.get("context")
+    if isinstance(handler_context, dict):
+        request.context = {**(request.context or {}), **handler_context}
+
+
 @router.post("/threads/{thread_id}/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
 async def create_run(
     thread_id: str,
@@ -62,25 +83,7 @@ async def create_run(
     if existing_thread and existing_thread.user_id != user.identity:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    # Authorization check (create_run action on threads resource)
-    ctx = build_auth_context(user, "threads", "create_run")
-    value = {**request.model_dump(), "thread_id": thread_id}
-    filters = await handle_event(ctx, value)
-
-    # If handler modified config/context, update request
-    if filters:
-        if "config" in filters and isinstance(filters["config"], dict):
-            request.config = {**(request.config or {}), **filters["config"]}
-        if "context" in filters and isinstance(filters["context"], dict):
-            request.context = {**(request.context or {}), **filters["context"]}
-    else:
-        value_config = value.get("config")
-        if isinstance(value_config, dict):
-            request.config = {**(request.config or {}), **value_config}
-
-        value_context = value.get("context")
-        if isinstance(value_context, dict):
-            request.context = {**(request.context or {}), **value_context}
+    await _authorize_run_creation(user, request, thread_id)
 
     _run_id, run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
 
@@ -112,6 +115,8 @@ async def create_and_stream_run(
         existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
         if existing_thread and existing_thread.user_id != user.identity:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
+
+        await _authorize_run_creation(user, request, thread_id)
 
         run_id, run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
 
@@ -272,10 +277,12 @@ async def update_run(
         # Handle interruption - use interrupt_run for cooperative interruption
         await streaming_service.interrupt_run(run_id)
         logger.info(f"[update_run] set DB status=interrupted run_id={run_id}")
+        # cancel_requested makes the interrupt durable: the owning worker's
+        # heartbeat honors it even if the pub/sub signal was lost.
         await session.execute(
             update(RunORM)
             .where(RunORM.run_id == str(run_id))
-            .values(status="interrupted", updated_at=datetime.now(UTC))
+            .values(status="interrupted", cancel_requested=True, updated_at=datetime.now(UTC))
         )
         await session.commit()
         logger.info(f"[update_run] commit done (interrupted) run_id={run_id}")
@@ -368,6 +375,8 @@ async def wait_for_run(
         existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
         if existing_thread and existing_thread.user_id != user.identity:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
+
+        await _authorize_run_creation(user, request, thread_id)
 
         run_id, _run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
 
@@ -528,6 +537,53 @@ async def join_thread_stream(
     )
 
 
+async def _mark_cancel_requested(session: AsyncSession, run_ids: list[str]) -> None:
+    """Persist the cancel intent so the owning worker's heartbeat honors it.
+
+    Durable and cross-instance: survives a dropped pub/sub signal and even a
+    worker crash (the reaper re-enqueues the run with the marker intact). Pub/sub
+    remains only an accelerator.
+    """
+    await session.execute(update(RunORM).where(RunORM.run_id.in_(run_ids)).values(cancel_requested=True))
+    await session.commit()
+
+
+async def _interrupt_pending(session: AsyncSession, run_ids: list[str]) -> None:
+    """Finalize unclaimed pending runs as interrupted — no executor will settle them.
+
+    A running run is left to its executor, which finalizes ``interrupted`` via the
+    marker/pub/sub. Guarded on ``status='pending'`` so a run a worker just claimed
+    is left for that worker, not stolen into a terminal state mid-flight.
+    """
+    await session.execute(
+        update(RunORM)
+        .where(RunORM.run_id.in_(run_ids), RunORM.status == "pending")
+        .values(status="interrupted", updated_at=datetime.now(UTC))
+    )
+    await session.commit()
+
+
+async def _wait_for_settle(
+    session: AsyncSession, run_ids: list[str], *, attempts: int = 20, delay: float = 0.5
+) -> None:
+    """Poll until every run's executor has fully settled it (terminal + lease released).
+
+    The termination signal is worker-controlled, never the API's own write. A run
+    is settled once its status is terminal AND its lease is released
+    (``claimed_by IS NULL``). A prod worker writes the terminal status in
+    finalize_run but only drops the lease afterwards, so the lease-release is the
+    definitive "worker is fully done" point — the safe moment to delete
+    checkpoints for a rollback. In dev ``claimed_by`` is always NULL, so this
+    reduces to waiting for the terminal status the local task writes. Bounded so a
+    crashed worker (orphaned lease on a terminal run) cannot block forever.
+    """
+    for _ in range(attempts):
+        await asyncio.sleep(delay)
+        rows = (await session.execute(select(RunORM.status, RunORM.claimed_by).where(RunORM.run_id.in_(run_ids)))).all()
+        if all(status in TERMINAL_STATES and claimed_by is None for status, claimed_by in rows):
+            return
+
+
 @router.post(
     "/threads/{thread_id}/runs/{run_id}/cancel",
     response_model=Run,
@@ -566,31 +622,29 @@ async def cancel_run_endpoint(
     if not run_orm:
         raise HTTPException(404, f"Run '{run_id}' not found")
 
+    # Persist the cancel intent first (durable, cross-instance), then fire the
+    # pub/sub accelerator. The executor — not the API — writes the terminal
+    # status, so a lost pub/sub message no longer lets the run finish and
+    # overwrite 'interrupted' back to 'success'.
+    logger.info(f"[cancel_run] {action} run_id={run_id} user={user.identity} thread_id={thread_id}")
+    await _mark_cancel_requested(session, [run_id])
     if action == "interrupt":
-        logger.info(f"[cancel_run] interrupt run_id={run_id} user={user.identity} thread_id={thread_id}")
         await streaming_service.interrupt_run(run_id)
     else:
-        logger.info(f"[cancel_run] {action} run_id={run_id} user={user.identity} thread_id={thread_id}")
         await streaming_service.cancel_run(run_id)
-    await session.execute(
-        update(RunORM).where(RunORM.run_id == str(run_id)).values(status="interrupted", updated_at=datetime.now(UTC))
-    )
-    await session.commit()
+    # Only a pending (unclaimed) run needs the API to settle it; a running run is
+    # finalized by its executor via the marker/pub/sub.
+    await _interrupt_pending(session, [run_id])
 
-    # Rollback must always settle first: deleting checkpoints while the
-    # executor is still finalizing would let it write rows back afterwards.
+    # Rollback must always settle first: deleting checkpoints while the executor
+    # is still finalizing would let it write rows back afterwards. The wait keys
+    # off the executor's own settle signal (terminal status + released lease),
+    # not a status the API pre-wrote — so it truly waits for the worker to stop.
     if wait or action == "rollback":
-        # Poll DB until the run reaches a terminal state (or 10s timeout).
-        # This is simpler and more reliable than pub/sub for cancel-with-wait
-        # since the cancel has already been issued and the status update committed.
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            session.expire_all()  # sync method, clears cache
-            fresh = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-            if fresh and fresh.status in TERMINAL_STATES:
-                break
+        await _wait_for_settle(session, [run_id])
 
     # Reload the settled snapshot (also what a rollback returns post-delete).
+    session.expire_all()
     run_orm = await session.scalar(
         select(RunORM).where(
             RunORM.run_id == run_id,
@@ -633,25 +687,22 @@ async def cancel_runs_bulk(
         raise HTTPException(404, "No runs found to cancel")
 
     run_ids = [row.run_id for row in rows]
+    # Persist the cancel intent (durable, cross-instance) before the pub/sub
+    # accelerator, then let each executor finalize its own run.
+    await _mark_cancel_requested(session, run_ids)
     for rid in run_ids:
         if action == "interrupt":
             await streaming_service.interrupt_run(rid)
         else:
             await streaming_service.cancel_run(rid)
-    await session.execute(
-        update(RunORM).where(RunORM.run_id.in_(run_ids)).values(status="interrupted", updated_at=datetime.now(UTC))
-    )
-    await session.commit()
+    # Pending (unclaimed) runs have no executor to settle them; the API does.
+    await _interrupt_pending(session, run_ids)
 
     if action == "rollback":
         # Settle before deleting checkpoints so a finalizing executor cannot
-        # write rows back afterwards (bounded to the single-cancel wait).
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            session.expire_all()
-            statuses = (await session.scalars(select(RunORM.status).where(RunORM.run_id.in_(run_ids)))).all()
-            if all(s in TERMINAL_STATES for s in statuses):
-                break
+        # write rows back afterwards. Keyed off the executor's settle signal
+        # (terminal status + released lease), not an API pre-write.
+        await _wait_for_settle(session, run_ids)
         await db_manager.get_checkpointer().adelete_for_runs(run_ids)
         await session.execute(delete(RunORM).where(RunORM.run_id.in_(run_ids)))
         await session.commit()

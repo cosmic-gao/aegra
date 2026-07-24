@@ -169,6 +169,34 @@ Set `CRON_ENABLED=false` to disable scheduling without removing cron records. Jo
 Cron firing is **at-least-once**: if a worker crashes after claiming a cron but before the run setup commits, the claim eventually expires (after `CRON_CLAIM_DURATION_SECONDS`) and another tick re-fires the cron. Make agent runs idempotent if duplicate firings are unacceptable.
 </Note>
 
+## Webhooks
+
+On a run's terminal state, a delivery row is written to a `webhook_deliveries` **transactional outbox** in the same transaction as the run status — so the notification survives a worker crash. A background deliverer claims rows (`FOR UPDATE SKIP LOCKED`, so replicas stay disjoint), POSTs them, retries with backoff, and moves exhausted rows to a `dead` state (dead-letter).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBHOOK_ENABLED` | `true` | Enable outbox enqueue + delivery |
+| `WEBHOOK_TIMEOUT_SECONDS` | `30` | Per-attempt HTTP timeout |
+| `WEBHOOK_MAX_ATTEMPTS` | `3` | Delivery attempts before dead-lettering |
+| `WEBHOOK_BACKOFF_BASE_SECONDS` | `1` | Base for exponential retry backoff |
+| `WEBHOOK_SIGNING_SECRET` | `""` | HMAC-SHA256 signing secret (Standard-Webhooks `Webhook-Signature`). Empty disables signing |
+| `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | SSRF guard: allow hosts resolving to private/reserved IPs (trusted internal targets only) |
+
+The deliverer's internal cadence, batch size, and stale-`sending` reclaim window are fixed constants (not env-tuned).
+
+## Retention (TTL)
+
+Both sweepers are **opt-in** and delete permanently. Each claims with `FOR UPDATE SKIP LOCKED` so multiple instances sweep disjoint rows.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHECKPOINTER_TTL_ENABLED` | `false` | Delete stale threads (no active run) + their checkpoints |
+| `CHECKPOINTER_TTL_MINUTES` | `43200` | Age (minutes) after which an idle thread is swept (30 days) |
+| `CHECKPOINTER_SWEEP_INTERVAL_MINUTES` | `60` | Thread sweep cadence |
+| `CHECKPOINTER_SWEEP_BATCH_SIZE` | `100` | Threads deleted per sweep |
+| `RUN_TTL_ENABLED` | `false` | Prune terminal run rows so the `runs` table doesn't grow unbounded (thread state + checkpoints untouched) |
+| `RUN_TTL_MINUTES` | `10080` | Age (minutes) after which a terminal run row is pruned (7 days) |
+
 ## Prometheus metrics
 
 | Variable | Default | Description |
@@ -184,6 +212,10 @@ When enabled, a `/metrics` endpoint serves standard HTTP request metrics (reques
 | `OTEL_SERVICE_NAME` | `aegra-backend` | Service name for traces |
 | `OTEL_TARGETS` | `""` | Comma-separated list: `LANGFUSE`, `PHOENIX`, `GENERIC` |
 | `OTEL_CONSOLE_EXPORT` | `false` | Log traces to console |
+| `OTEL_HIDE_LLM_INPUTS` | `false` | Redact LLM prompts/inputs from exported spans (PII). Off defers to OpenInference's own `OPENINFERENCE_HIDE_*` env |
+| `OTEL_HIDE_LLM_OUTPUTS` | `false` | Redact LLM completions/outputs from exported spans (PII) |
+| `OTEL_TRACES_SAMPLER` | `""` | Trace sampler: e.g. `parentbased_traceidratio`, `traceidratio`, `always_on`, `always_off`. Empty keeps the SDK default |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio `[0.0, 1.0]` for the ratio-based samplers |
 
 ### Langfuse
 

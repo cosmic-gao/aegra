@@ -47,7 +47,9 @@ from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
 from aegra_api.services.mcp_server import mcp as mcp_server
 from aegra_api.services.mcp_server import mcp_app
+from aegra_api.services.run_ttl_sweeper import run_ttl_sweeper
 from aegra_api.services.thread_ttl_sweeper import thread_ttl_sweeper
+from aegra_api.services.webhook_deliverer import webhook_deliverer
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
 
@@ -153,12 +155,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Start thread TTL sweeper (no-op unless CHECKPOINTER_TTL_ENABLED)
     await thread_ttl_sweeper.start()
 
+    # Start run TTL sweeper (no-op unless RUN_TTL_ENABLED)
+    await run_ttl_sweeper.start()
+
+    # Start webhook deliverer (drains the transactional outbox)
+    await webhook_deliverer.start()
+
     # Run the MCP session manager for the mounted /mcp app (when enabled).
     mcp_ctx = mcp_server.session_manager.run() if _mcp_enabled() else nullcontext()
     async with mcp_ctx:
         yield
 
-    # Shutdown order: ttl → delayed-run → cron → reaper → executor (drains) → broker → Redis → DB
+    # Shutdown order: webhook → run-ttl → thread-ttl → delayed-run → cron → reaper → executor (drains) → broker → Redis → DB
+    await webhook_deliverer.stop()
+    await run_ttl_sweeper.stop()
     await thread_ttl_sweeper.stop()
     await delayed_run_scheduler.stop()
     if settings.cron.CRON_ENABLED:

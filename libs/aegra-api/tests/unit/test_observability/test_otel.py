@@ -3,6 +3,14 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from openinference.instrumentation import TraceConfig
+from opentelemetry.sdk.trace.sampling import (
+    ALWAYS_OFF,
+    ALWAYS_ON,
+    ParentBased,
+    ParentBasedTraceIdRatio,
+    TraceIdRatioBased,
+)
 
 from aegra_api.observability.otel import OpenTelemetryProvider
 from aegra_api.observability.span_enrichment import RunIdGenerator
@@ -137,6 +145,10 @@ class TestOpenTelemetryProviderSetup:
             # Setup defaults
             mock_settings.observability.OTEL_SERVICE_NAME = "test-service"
             mock_settings.observability.OTEL_CONSOLE_EXPORT = False  # Default to False to prevent noise
+            mock_settings.observability.OTEL_HIDE_LLM_INPUTS = False
+            mock_settings.observability.OTEL_HIDE_LLM_OUTPUTS = False
+            mock_settings.observability.OTEL_TRACES_SAMPLER = ""
+            mock_settings.observability.OTEL_TRACES_SAMPLER_ARG = 1.0
             mock_settings.app.VERSION = "1.0.0"
             mock_settings.app.ENV_MODE = "TEST"
 
@@ -248,8 +260,50 @@ class TestOpenTelemetryProviderSetup:
 
         mock_deps["trace"].set_tracer_provider.assert_called_with(mock_deps["tp"].return_value)
 
-        mock_deps["lci"].return_value.instrument.assert_called_with(tracer_provider=mock_deps["tp"].return_value)
+        _, lci_kwargs = mock_deps["lci"].return_value.instrument.call_args
+        assert lci_kwargs["tracer_provider"] is mock_deps["tp"].return_value
+        assert isinstance(lci_kwargs["config"], TraceConfig)
         mock_deps["hci"].return_value.instrument.assert_called_with(tracer_provider=mock_deps["tp"].return_value)
+
+    def test_setup_passes_resolved_sampler_to_tracer_provider(self, mock_deps):
+        """A configured ratio sampler is constructed and handed to TracerProvider."""
+        mock_deps["settings"].observability.OTEL_CONSOLE_EXPORT = True
+        mock_deps["settings"].observability.OTEL_TRACES_SAMPLER = "traceidratio"
+        mock_deps["settings"].observability.OTEL_TRACES_SAMPLER_ARG = 0.25
+
+        provider = OpenTelemetryProvider()
+        provider.setup()
+
+        _, tp_kwargs = mock_deps["tp"].call_args
+        sampler = tp_kwargs["sampler"]
+        assert isinstance(sampler, TraceIdRatioBased)
+        assert sampler.rate == 0.25
+
+    def test_setup_defaults_to_none_sampler(self, mock_deps):
+        """No sampler configured → None passed, preserving the SDK default."""
+        mock_deps["settings"].observability.OTEL_CONSOLE_EXPORT = True
+        mock_deps["settings"].observability.OTEL_TRACES_SAMPLER = ""
+
+        provider = OpenTelemetryProvider()
+        provider.setup()
+
+        _, tp_kwargs = mock_deps["tp"].call_args
+        assert tp_kwargs["sampler"] is None
+
+    def test_setup_passes_redaction_config_to_instrumentor(self, mock_deps, monkeypatch):
+        """Redaction toggles reach LangChainInstrumentor as TraceConfig hide flags."""
+        monkeypatch.delenv("OPENINFERENCE_HIDE_INPUTS", raising=False)
+        monkeypatch.delenv("OPENINFERENCE_HIDE_OUTPUTS", raising=False)
+        mock_deps["settings"].observability.OTEL_CONSOLE_EXPORT = True
+        mock_deps["settings"].observability.OTEL_HIDE_LLM_INPUTS = True
+        mock_deps["settings"].observability.OTEL_HIDE_LLM_OUTPUTS = False
+
+        provider = OpenTelemetryProvider()
+        provider.setup()
+
+        _, lci_kwargs = mock_deps["lci"].return_value.instrument.call_args
+        assert lci_kwargs["config"].hide_inputs is True
+        assert lci_kwargs["config"].hide_outputs is False
 
 
 class TestOpenTelemetryProviderRuntime:
@@ -320,3 +374,123 @@ class TestOpenTelemetryProviderRuntime:
 
             meta = provider.get_metadata("run-1", "thread-1")
             assert meta == {}
+
+
+class TestResolveSampler:
+    """Tests for OTEL_TRACES_SAMPLER → Sampler resolution."""
+
+    @pytest.fixture
+    def mock_settings(self):
+        """Patch settings with tracing off so the provider constructs cleanly."""
+        with patch("aegra_api.observability.otel.settings") as mock:
+            mock.observability.OTEL_TARGETS = ""
+            mock.observability.OTEL_CONSOLE_EXPORT = False
+            mock.observability.OTEL_TRACES_SAMPLER = ""
+            mock.observability.OTEL_TRACES_SAMPLER_ARG = 1.0
+            yield mock
+
+    def test_empty_keeps_sdk_default(self, mock_settings):
+        """Empty sampler name → None so TracerProvider keeps its own default."""
+        provider = OpenTelemetryProvider()
+        assert provider._resolve_sampler() is None
+
+    def test_always_on(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "always_on"
+        provider = OpenTelemetryProvider()
+        assert provider._resolve_sampler() is ALWAYS_ON
+
+    def test_always_off(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "always_off"
+        provider = OpenTelemetryProvider()
+        assert provider._resolve_sampler() is ALWAYS_OFF
+
+    def test_parentbased_always_on(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "parentbased_always_on"
+        provider = OpenTelemetryProvider()
+        sampler = provider._resolve_sampler()
+        assert isinstance(sampler, ParentBased)
+        assert not isinstance(sampler, ParentBasedTraceIdRatio)
+
+    def test_traceidratio(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "traceidratio"
+        mock_settings.observability.OTEL_TRACES_SAMPLER_ARG = 0.1
+        provider = OpenTelemetryProvider()
+        sampler = provider._resolve_sampler()
+        assert isinstance(sampler, TraceIdRatioBased)
+        assert sampler.rate == 0.1
+
+    def test_parentbased_traceidratio(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "parentbased_traceidratio"
+        mock_settings.observability.OTEL_TRACES_SAMPLER_ARG = 0.5
+        provider = OpenTelemetryProvider()
+        sampler = provider._resolve_sampler()
+        assert isinstance(sampler, ParentBasedTraceIdRatio)
+        assert "TraceIdRatioBased{0.5}" in sampler.get_description()
+
+    def test_whitespace_and_casing_normalized(self, mock_settings):
+        """Parsing is robust to surrounding whitespace and case, like OTEL_TARGETS."""
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "  TraceIdRatio  "
+        mock_settings.observability.OTEL_TRACES_SAMPLER_ARG = 0.3
+        provider = OpenTelemetryProvider()
+        sampler = provider._resolve_sampler()
+        assert isinstance(sampler, TraceIdRatioBased)
+        assert sampler.rate == 0.3
+
+    def test_unknown_name_falls_back_to_default(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "bogus"
+        provider = OpenTelemetryProvider()
+        with patch("aegra_api.observability.otel.logger") as mock_logger:
+            assert provider._resolve_sampler() is None
+            mock_logger.warning.assert_called_once()
+
+    def test_ratio_out_of_range_falls_back_to_default(self, mock_settings):
+        mock_settings.observability.OTEL_TRACES_SAMPLER = "traceidratio"
+        mock_settings.observability.OTEL_TRACES_SAMPLER_ARG = 1.5
+        provider = OpenTelemetryProvider()
+        with patch("aegra_api.observability.otel.logger") as mock_logger:
+            assert provider._resolve_sampler() is None
+            mock_logger.warning.assert_called_once()
+
+
+class TestBuildTraceConfig:
+    """Tests for OTEL_HIDE_LLM_* → OpenInference TraceConfig mapping."""
+
+    @pytest.fixture
+    def mock_settings(self, monkeypatch):
+        """Patch settings and clear native env vars for deterministic resolution."""
+        monkeypatch.delenv("OPENINFERENCE_HIDE_INPUTS", raising=False)
+        monkeypatch.delenv("OPENINFERENCE_HIDE_OUTPUTS", raising=False)
+        with patch("aegra_api.observability.otel.settings") as mock:
+            mock.observability.OTEL_TARGETS = ""
+            mock.observability.OTEL_CONSOLE_EXPORT = False
+            mock.observability.OTEL_HIDE_LLM_INPUTS = False
+            mock.observability.OTEL_HIDE_LLM_OUTPUTS = False
+            yield mock
+
+    def test_both_off_resolves_to_false(self, mock_settings):
+        """Toggles off with no env vars → flags resolve to False (status quo)."""
+        provider = OpenTelemetryProvider()
+        config = provider._build_trace_config()
+        assert config.hide_inputs is False
+        assert config.hide_outputs is False
+
+    def test_inputs_on(self, mock_settings):
+        mock_settings.observability.OTEL_HIDE_LLM_INPUTS = True
+        provider = OpenTelemetryProvider()
+        config = provider._build_trace_config()
+        assert config.hide_inputs is True
+        assert config.hide_outputs is False
+
+    def test_outputs_on(self, mock_settings):
+        mock_settings.observability.OTEL_HIDE_LLM_OUTPUTS = True
+        provider = OpenTelemetryProvider()
+        config = provider._build_trace_config()
+        assert config.hide_inputs is False
+        assert config.hide_outputs is True
+
+    def test_off_defers_to_native_env_var(self, mock_settings, monkeypatch):
+        """Toggle off must not force redaction off: a native env var still wins."""
+        monkeypatch.setenv("OPENINFERENCE_HIDE_INPUTS", "true")
+        provider = OpenTelemetryProvider()
+        config = provider._build_trace_config()
+        assert config.hide_inputs is True

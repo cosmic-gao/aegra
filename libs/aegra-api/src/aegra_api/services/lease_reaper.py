@@ -8,11 +8,11 @@ Redis job queue so another worker can pick them up.
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import structlog
 from redis import RedisError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
@@ -92,15 +92,18 @@ class LeaseReaper:
 
         Returns (crashed_run_ids, stuck_pending_run_ids) separately so retry
         budget is only charged to crashed runs, not stuck pending ones.
+
+        Both thresholds compare against the DB clock (``now()``), not this pod's
+        wall clock, so a skewed reaper cannot reclaim a lease that is still valid
+        on the DB's timeline (the double-run window per-pod time would open).
         """
-        now = datetime.now(UTC)
         maker = _get_session_maker()
         async with maker() as session:
             crashed_result = await session.execute(
                 select(RunORM.run_id).where(
                     RunORM.status == "running",
                     RunORM.lease_expires_at.isnot(None),
-                    RunORM.lease_expires_at < now,
+                    RunORM.lease_expires_at < func.now(),
                 )
             )
             crashed = [row[0] for row in crashed_result.fetchall()]
@@ -109,7 +112,7 @@ class LeaseReaper:
                 select(RunORM.run_id).where(
                     RunORM.status == "pending",
                     RunORM.claimed_by.is_(None),
-                    RunORM.created_at < now - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
+                    RunORM.created_at < func.now() - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
                 )
             )
             stuck_pending = [row[0] for row in stuck_result.fetchall()]
@@ -118,7 +121,11 @@ class LeaseReaper:
 
     @staticmethod
     async def _reset_to_pending(run_ids: list[str]) -> list[str]:
-        """Reset crashed runs to pending. Re-checks lease expiry atomically."""
+        """Reset crashed runs to pending. Re-checks lease expiry atomically.
+
+        The re-check uses the DB clock (``func.now()``) — same source as the
+        initial find — so the atomic reclaim can't race a pod's skewed wall clock.
+        """
         maker = _get_session_maker()
         async with maker() as session:
             result = await session.execute(
@@ -126,7 +133,7 @@ class LeaseReaper:
                 .where(
                     RunORM.run_id.in_(run_ids),
                     RunORM.status == "running",
-                    RunORM.lease_expires_at < datetime.now(UTC),
+                    RunORM.lease_expires_at < func.now(),
                 )
                 .values(status="pending", claimed_by=None, lease_expires_at=None)
                 .returning(RunORM.run_id)

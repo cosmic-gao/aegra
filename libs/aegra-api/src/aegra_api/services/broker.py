@@ -6,6 +6,7 @@ The broker handles both live event broadcast (via queue) and replay storage
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -17,6 +18,11 @@ from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
 
 logger = structlog.getLogger(__name__)
+
+# Bound in-memory buffers so a slow/stuck SSE consumer can't OOM the process.
+# Mirrors the Redis backend's caps; the replay buffer drops oldest past the cap.
+_REPLAY_MAX_EVENTS = 10_000
+_SUBSCRIBER_QUEUE_MAX = 10_000
 
 
 class RunBroker(BaseRunBroker):
@@ -31,7 +37,7 @@ class RunBroker(BaseRunBroker):
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         self.finished = asyncio.Event()
-        self._replay_buffer: list[tuple[str, Any]] = []
+        self._replay_buffer: deque[tuple[str, Any]] = deque(maxlen=_REPLAY_MAX_EVENTS)
         self._subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
         self._created_at = asyncio.get_running_loop().time()
 
@@ -44,6 +50,12 @@ class RunBroker(BaseRunBroker):
             self._replay_buffer.append((event_id, payload))
 
         for queue in list(self._subscribers):
+            if queue.full():
+                # Drop the oldest event for a slow consumer rather than block the
+                # producer or grow without bound; it can resync via replay by id.
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+                logger.warning("Subscriber queue full, dropped oldest event", run_id=self.run_id)
             queue.put_nowait((event_id, payload))
 
         # Check if this is an end event
@@ -51,7 +63,7 @@ class RunBroker(BaseRunBroker):
             self.mark_finished()
 
     async def aiter(self) -> AsyncIterator[tuple[str, Any]]:
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAX)
         # Register, then replay the buffer into this iterator: any event put
         # between a caller's separate replay() and this registration is still in
         # the buffer, so nothing is dropped. Callers dedup the overlap by event_id.
@@ -76,19 +88,23 @@ class RunBroker(BaseRunBroker):
             self._subscribers.discard(queue)
 
     async def replay(self, last_event_id: str | None) -> list[tuple[str, Any]]:
-        if not self._replay_buffer:
+        buffer = list(self._replay_buffer)
+        if not buffer:
             return []
-
         if last_event_id is None:
-            return list(self._replay_buffer)
-
-        # Find the index after last_event_id
-        for i, (eid, _) in enumerate(self._replay_buffer):
+            return buffer
+        for i, (eid, _) in enumerate(buffer):
             if eid == last_event_id:
-                return list(self._replay_buffer[i + 1 :])
-
-        # last_event_id not found — return all
-        return list(self._replay_buffer)
+                return buffer[i + 1 :]
+        # Cursor evicted — surface the gap; the client may have missed events
+        # between its cursor and the oldest survivor.
+        logger.warning(
+            "Replay cursor evicted; resuming from oldest survivor (events may be missed)",
+            run_id=self.run_id,
+            last_event_id=last_event_id,
+            survivors=len(buffer),
+        )
+        return buffer
 
     def mark_finished(self) -> None:
         self.finished.set()

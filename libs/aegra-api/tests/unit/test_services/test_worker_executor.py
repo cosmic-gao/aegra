@@ -198,7 +198,11 @@ class TestHeartbeatLoop:
     @pytest.mark.asyncio
     async def test_extends_lease_on_each_iteration(self) -> None:
         session = AsyncMock()
-        session.execute = AsyncMock()
+        # Lease extension UPDATE...RETURNING(cancel_requested): a matched row with
+        # cancel_requested=False means "lease still ours, no cancel" → keep looping.
+        result = MagicMock()
+        result.first.return_value = MagicMock(cancel_requested=False)
+        session.execute = AsyncMock(return_value=result)
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
@@ -258,6 +262,149 @@ class TestHeartbeatLoop:
 # ------------------------------------------------------------------
 # _is_run_terminal
 # ------------------------------------------------------------------
+
+
+class TestHeartbeatCancelMarker:
+    """P0-5: a persisted cancel is honored by the heartbeat even without pub/sub."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_job_on_marker_without_lease_loss_flag(self) -> None:
+        from aegra_api.services.run_executor import _lease_loss_cancellations
+
+        session = AsyncMock()
+        result = MagicMock()
+        result.first.return_value = MagicMock(cancel_requested=True)
+        session.execute = AsyncMock(return_value=result)
+        session.commit = AsyncMock()
+        maker = _make_session_maker(session)
+
+        job_task = MagicMock()
+        job_task.done.return_value = False
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        async def one_tick(_delay: float) -> None:
+            return None
+
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(f"{MODULE}.settings") as mock_settings,
+            patch(f"{MODULE}.asyncio.sleep", side_effect=one_tick),
+        ):
+            mock_settings.worker.HEARTBEAT_INTERVAL_SECONDS = 1
+            mock_settings.worker.LEASE_DURATION_SECONDS = 30
+            await _heartbeat_loop(run_id, "worker-0", job_task=job_task)
+
+        # Job cancelled as a USER cancel (execute_run must finalize interrupted),
+        # so the run_id must NOT be flagged as a lease-loss handoff.
+        job_task.cancel.assert_called_once()
+        assert run_id not in _lease_loss_cancellations
+
+    @pytest.mark.asyncio
+    async def test_lease_loss_flags_set_and_cancels(self) -> None:
+        from aegra_api.services.run_executor import _lease_loss_cancellations
+
+        session = AsyncMock()
+        result = MagicMock()
+        result.first.return_value = None  # no row updated → lease lost
+        session.execute = AsyncMock(return_value=result)
+        session.commit = AsyncMock()
+        maker = _make_session_maker(session)
+
+        job_task = MagicMock()
+        job_task.done.return_value = False
+        run_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+
+        async def one_tick(_delay: float) -> None:
+            return None
+
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(f"{MODULE}.settings") as mock_settings,
+            patch(f"{MODULE}.asyncio.sleep", side_effect=one_tick),
+        ):
+            mock_settings.worker.HEARTBEAT_INTERVAL_SECONDS = 1
+            mock_settings.worker.LEASE_DURATION_SECONDS = 30
+            try:
+                await _heartbeat_loop(run_id, "worker-0", job_task=job_task)
+                job_task.cancel.assert_called_once()
+                assert run_id in _lease_loss_cancellations
+            finally:
+                _lease_loss_cancellations.discard(run_id)
+
+
+class TestMarkShutdownCancellations:
+    """P0-4: stop() flags drained-but-running jobs so their handlers hand off."""
+
+    def test_maps_pending_tasks_to_run_ids_via_active_runs(self) -> None:
+        from aegra_api.services.run_executor import _shutdown_cancellations
+        from aegra_api.services.worker_executor import _mark_shutdown_cancellations
+
+        t1 = MagicMock()
+        t2 = MagicMock()
+        untracked = MagicMock()
+        active_runs["run-a"] = t1
+        active_runs["run-b"] = t2
+        try:
+            result = _mark_shutdown_cancellations({t1, untracked})
+            assert result == ["run-a"]
+            assert "run-a" in _shutdown_cancellations
+            assert "run-b" not in _shutdown_cancellations
+        finally:
+            active_runs.pop("run-a", None)
+            active_runs.pop("run-b", None)
+            _shutdown_cancellations.discard("run-a")
+
+
+class TestReenqueueStranded:
+    @pytest.mark.asyncio
+    async def test_rpushes_each_run_id(self) -> None:
+        from aegra_api.services.worker_executor import _reenqueue_stranded
+
+        client = AsyncMock()
+        with (
+            patch(f"{MODULE}.redis_manager") as mock_rm,
+            patch(f"{MODULE}.settings") as mock_settings,
+        ):
+            mock_settings.worker.WORKER_QUEUE_KEY = "aegra:jobs"
+            mock_rm.get_client.return_value = client
+            await _reenqueue_stranded(["run-1", "run-2"])
+
+        assert client.rpush.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_noop_on_empty_list(self) -> None:
+        from aegra_api.services.worker_executor import _reenqueue_stranded
+
+        with patch(f"{MODULE}.redis_manager") as mock_rm:
+            await _reenqueue_stranded([])
+
+        mock_rm.get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_best_effort_when_redis_client_unavailable(self) -> None:
+        from aegra_api.services.worker_executor import _reenqueue_stranded
+
+        with (
+            patch(f"{MODULE}.redis_manager") as mock_rm,
+            patch(f"{MODULE}.settings") as mock_settings,
+            patch(f"{MODULE}.logger.warning") as mock_warning,
+        ):
+            mock_settings.worker.WORKER_QUEUE_KEY = "aegra:jobs"
+            mock_rm.get_client.side_effect = RuntimeError("Redis not initialized")
+            # Must not raise — the reaper's stuck-pending sweep recovers these.
+            await _reenqueue_stranded(["run-1"])
+
+        mock_warning.assert_called_once()
+
+
+class TestDbLeaseExpiry:
+    """P1-4: lease expiry is computed by the DB clock, parameterized."""
+
+    def test_expiry_is_based_on_db_now(self) -> None:
+        from aegra_api.services.worker_executor import _db_lease_expiry
+
+        sql = str(_db_lease_expiry(30)).lower()
+        assert "now()" in sql
 
 
 class TestIsRunTerminal:
@@ -479,6 +626,29 @@ class TestWorkerExecutorSubmit:
 
         mock_client.rpush.assert_awaited_once_with("aegra:jobs", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
+    @pytest.mark.asyncio
+    async def test_enqueue_failure_is_best_effort(self) -> None:
+        """P0-3: a Redis outage on enqueue must not raise — the row is durably
+        pending and the reaper's stuck-pending sweep dispatches it."""
+        mock_client = AsyncMock()
+        mock_client.rpush = AsyncMock(side_effect=RedisConnectionError("down"))
+
+        job = _make_run_job()
+
+        with (
+            patch(f"{MODULE}.redis_manager") as mock_redis,
+            patch(f"{MODULE}.settings") as mock_settings,
+            patch(f"{MODULE}._ENQUEUE_MAX_ATTEMPTS", 2),
+        ):
+            mock_redis.get_client.return_value = mock_client
+            mock_settings.worker.WORKER_QUEUE_KEY = "aegra:jobs"
+
+            executor = WorkerExecutor()
+            await executor.submit(job)  # must not raise
+
+        # Retried up to the cap before giving up.
+        assert mock_client.rpush.await_count == 2
+
 
 # ------------------------------------------------------------------
 # WorkerExecutor.wait_for_completion
@@ -603,51 +773,45 @@ class TestExecuteAndRelease:
         assert not semaphore.locked()
 
     @pytest.mark.asyncio
-    async def test_handles_timeout_error(self) -> None:
+    async def test_wakes_successor_only_when_claimed(self) -> None:
+        """P1-5: a declined claim (thread busy) must NOT re-enqueue itself — that
+        would spin BLPOP→claim-fail→re-enqueue. Successor wake fires only after a
+        run that actually held (and thus freed) the thread."""
         run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        semaphore = asyncio.Semaphore(1)
-        await semaphore.acquire()
-
         executor = WorkerExecutor()
 
-        async def slow_execute(rid: str, wn: str) -> None:
-            await asyncio.sleep(9999)
+        # Claim declined → _execute_with_lease returns False → no wake.
+        executor._execute_with_lease = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        with patch(f"{MODULE}._wake_thread_successor", new_callable=AsyncMock) as mock_wake:
+            await executor._execute_and_release(run_id, "worker-0", asyncio.Semaphore(1))
+        mock_wake.assert_not_awaited()
 
-        executor._execute_with_lease = AsyncMock(side_effect=slow_execute)  # type: ignore[method-assign]
+        # Claim succeeded → _execute_with_lease returns True → wake fires once.
+        executor._execute_with_lease = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        with patch(f"{MODULE}._wake_thread_successor", new_callable=AsyncMock) as mock_wake:
+            await executor._execute_and_release(run_id, "worker-0", asyncio.Semaphore(1))
+        mock_wake.assert_awaited_once_with(run_id)
 
-        thread_id = "tttttttt-tttt-tttt-tttt-tttttttttttt"
+    @pytest.mark.asyncio
+    async def test_orphaned_error_finalized_on_unexpected_exception(self) -> None:
+        """P0-4: an error escaping _execute_with_lease finalizes the run as error
+        instead of stranding it 'running' until the reaper."""
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        executor = WorkerExecutor()
+        executor._execute_with_lease = AsyncMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
 
-        with (
-            patch(f"{MODULE}.settings") as mock_settings,
-            patch(f"{MODULE}._get_thread_id_for_run", new_callable=AsyncMock, return_value=thread_id),
-            patch(f"{MODULE}.finalize_run", new_callable=AsyncMock) as mock_finalize,
-            patch(f"{MODULE}._release_lease") as mock_release,
-        ):
-            mock_settings.worker.BG_JOB_TIMEOUT_SECS = 0.01  # Very short timeout
-            mock_release.return_value = None
+        with patch(f"{MODULE}._finalize_orphan", new_callable=AsyncMock) as mock_orphan:
+            await executor._execute_and_release(run_id, "worker-0", asyncio.Semaphore(1))
 
-            await executor._execute_and_release(run_id, "worker-0", semaphore)
-
-        mock_finalize.assert_awaited_once_with(
-            run_id,
-            thread_id,
-            status="error",
-            thread_status="error",
-            error="Job exceeded maximum execution time",
-        )
-        mock_release.assert_awaited_once_with(run_id, "worker-0")
-        # Semaphore released even on timeout
-        assert not semaphore.locked()
-        # Cleaned up
-        assert run_id not in active_runs
+        mock_orphan.assert_awaited_once_with(run_id, "worker-0")
 
 
 class TestExecuteWithLease:
     @pytest.mark.asyncio
     async def test_cancels_job_task_in_finally(self) -> None:
-        """Regression: when _execute_with_lease is cancelled (e.g. by wait_for
-        timeout), the inner job_task must also be cancelled to prevent orphaned
-        execution that corrupts run state."""
+        """Regression: when _execute_with_lease is cancelled (worker shutdown),
+        the inner job_task must also be cancelled to prevent orphaned execution,
+        and the CancelledError must propagate (not be swallowed)."""
         run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         executor = WorkerExecutor()
 
@@ -672,16 +836,64 @@ class TestExecuteWithLease:
             patch(f"{MODULE}._heartbeat_loop", new_callable=AsyncMock),
             patch(f"{MODULE}._release_lease", new_callable=AsyncMock),
         ):
-            # Run _execute_with_lease in a task and cancel it (simulating wait_for timeout).
-            # The CancelledError is caught internally by _execute_with_lease's
-            # except block, so the task completes normally — but the inner
-            # job_task must still have been cancelled.
             task = asyncio.create_task(executor._execute_with_lease(run_id, "worker-0"))
             await asyncio.sleep(0.05)  # Let it start
             task.cancel()
-            await task  # Completes normally (CancelledError is handled internally)
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         assert job_task_was_cancelled, "job_task must be cancelled when _execute_with_lease is cancelled"
+
+    @pytest.mark.asyncio
+    async def test_timeout_finalizes_once_as_timeout(self) -> None:
+        """P0-2: a job exceeding BG_JOB_TIMEOUT_SECS is cancelled and finalized as
+        a single 'timeout' write (not 'error', not a double write), with the run
+        flagged in _timeout_cancellations so execute_run defers the finalize."""
+        from aegra_api.services.run_executor import _timeout_cancellations
+
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        thread_id = "tttttttt-tttt-tttt-tttt-tttttttttttt"
+        executor = WorkerExecutor()
+        flagged_during_run = False
+
+        async def slow_job(job: object) -> None:
+            nonlocal flagged_during_run
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                flagged_during_run = run_id in _timeout_cancellations
+                raise
+
+        mock_loaded = MagicMock(spec=_LoadedRun)
+        mock_loaded.job = _make_run_job()
+        mock_loaded.trace = {}
+
+        with (
+            patch(f"{MODULE}._acquire_and_load", new_callable=AsyncMock, return_value=mock_loaded),
+            patch(f"{MODULE}._restore_trace_context"),
+            patch(f"{MODULE}.execute_run", side_effect=slow_job),
+            patch(f"{MODULE}._heartbeat_loop", new_callable=AsyncMock),
+            patch(f"{MODULE}._get_thread_id_for_run", new_callable=AsyncMock, return_value=thread_id),
+            patch(f"{MODULE}.finalize_run", new_callable=AsyncMock) as mock_finalize,
+            patch(f"{MODULE}._release_lease", new_callable=AsyncMock) as mock_release,
+            patch(f"{MODULE}.settings") as mock_settings,
+        ):
+            mock_settings.worker.BG_JOB_TIMEOUT_SECS = 0.01
+            try:
+                claimed = await executor._execute_with_lease(run_id, "worker-0")
+            finally:
+                _timeout_cancellations.discard(run_id)
+
+        assert claimed is True
+        assert flagged_during_run, "run must be flagged in _timeout_cancellations before job cancel"
+        mock_finalize.assert_awaited_once_with(
+            run_id,
+            thread_id,
+            status="timeout",
+            thread_status="error",
+            error="Job exceeded maximum execution time",
+        )
+        mock_release.assert_awaited_once_with(run_id, "worker-0")
 
 
 class TestDequeue:

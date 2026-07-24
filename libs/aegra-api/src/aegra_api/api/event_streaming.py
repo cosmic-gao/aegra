@@ -21,7 +21,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -102,6 +102,21 @@ def _require_v2_enabled() -> None:
         raise HTTPException(503, caps.error_message)
 
 
+def _parse_since(last_event_id: str | None) -> int | None:
+    """Parse a ``Last-Event-ID`` header (the seq) into a ``since`` cursor.
+
+    Browser EventSource echoes the last ``id:`` on auto-reconnect; the v2 id is
+    the integer seq. A non-integer header is ignored (resume from the start).
+    """
+    if not last_event_id:
+        return None
+    try:
+        return int(last_event_id)
+    except ValueError:
+        logger.warning("Ignoring non-integer Last-Event-ID", last_event_id=last_event_id[:64])
+        return None
+
+
 # Error responses both v2 routes can emit, for an accurate OpenAPI contract.
 _V2_ERROR_RESPONSES: dict[int | str, dict[str, str]] = {
     400: {"description": "Invalid request (unsupported channels, malformed command)"},
@@ -122,6 +137,7 @@ _V2_ERROR_RESPONSES: dict[int | str, dict[str, str]] = {
 async def stream_thread_events(
     thread_id: str,
     body: EventStreamRequest,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
     user: User = Depends(get_current_user),
 ) -> EventSourceResponse:
     """Open a channel-filtered SSE stream of the thread's run events.
@@ -131,6 +147,9 @@ async def stream_thread_events(
     ``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client
     echoes back as ``since`` on resume.
 
+    Resume cursor: explicit ``body.since`` wins; otherwise the ``Last-Event-ID``
+    header is honored so a browser ``EventSource`` auto-reconnect resumes too.
+
     DB work runs in short-lived sessions (the upfront ownership check here, and
     each run-lister poll) so no connection is held for the SSE lifetime (#423).
     """
@@ -139,6 +158,8 @@ async def stream_thread_events(
     channels, invalid = validate_channels(body.channels)
     if invalid:
         raise HTTPException(400, f"Unsupported channels: {', '.join(invalid)}")
+
+    since = body.since if body.since is not None else _parse_since(last_event_id)
 
     # The SDK opens the stream before run.start, against a thread it minted
     # client-side — a not-yet-existing thread is allowed; one owned by another
@@ -151,7 +172,7 @@ async def stream_thread_events(
         thread_id,
         channels=channels,
         list_run_ids=_thread_run_lister(thread_id, user),
-        since=body.since,
+        since=since,
         namespaces=body.namespaces,
         depth=body.depth,
     )
@@ -404,7 +425,9 @@ class _ProtocolSocket:
                     assistant_id = await _thread_assistant_id(session, self._thread_id, self._user)
                 if not assistant_id:
                     return build_error(
-                        command_id, "no_such_run", "No run on this thread to resolve an assistant from; pass assistant_id."
+                        command_id,
+                        "no_such_run",
+                        "No run on this thread to resolve an assistant from; pass assistant_id.",
                     )
                 service = AssistantService(session, self._user, get_langgraph_service())
                 graph = await service.get_assistant_graph(assistant_id, xray)

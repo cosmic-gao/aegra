@@ -31,6 +31,35 @@ class TestRunBroker:
         assert replayed == [("evt-1", {"data": "test"})]
 
     @pytest.mark.asyncio
+    async def test_replay_buffer_is_bounded(self) -> None:
+        """Replay buffer drops oldest past the cap so it can't grow without bound."""
+        from aegra_api.services import broker as broker_mod
+
+        broker = RunBroker("run-cap")
+        cap = broker_mod._REPLAY_MAX_EVENTS
+        for i in range(cap + 50):
+            await broker.put(f"evt-{i}", {"i": i})
+
+        replayed = await broker.replay(None)
+        assert len(replayed) == cap
+        assert replayed[0][0] == "evt-50"  # oldest 50 evicted
+        assert replayed[-1][0] == f"evt-{cap + 49}"
+
+    @pytest.mark.asyncio
+    async def test_full_subscriber_queue_drops_oldest(self) -> None:
+        """A full subscriber queue drops its oldest event instead of blocking/growing."""
+        broker = RunBroker("run-slow")
+        q: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=2)
+        broker._subscribers.add(q)
+
+        await broker.put("evt-1", {"n": 1})
+        await broker.put("evt-2", {"n": 2})
+        await broker.put("evt-3", {"n": 3})  # full → drop oldest (evt-1)
+
+        assert q.qsize() == 2
+        assert q.get_nowait()[0] == "evt-2"
+
+    @pytest.mark.asyncio
     async def test_put_end_event_marks_finished(self):
         """Test that end event marks broker as finished"""
         broker = RunBroker("run-123")

@@ -5,6 +5,11 @@ The native v3 stream hands messages already content-block-shaped, but
 and ``__interrupt__`` markers. These helpers project those into the
 protocol's state-message shape, split interrupts onto the input channel,
 and map run status to a lifecycle status.
+
+Kept hand-rolled over ``BaseMessage.content_blocks``: that yields the v1 block
+shape (``base64`` fields, generated ids, tool calls folded into ``content``, and
+it drops ``additional_kwargs`` audio) — not this protocol's state-message shape
+(``data`` fields, no ids, ``tool_calls`` split out). See tests/.../test_normalizers.py.
 """
 
 from __future__ import annotations

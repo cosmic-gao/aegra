@@ -106,9 +106,9 @@ class Assistant(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
-    # Indexes for performance
+    # idx_assistant_user_assistant (user_id, assistant_id) covers user_id
+    # equality via its left prefix, so no standalone user_id index.
     __table_args__ = (
-        Index("idx_assistant_user", "user_id"),
         Index("idx_assistant_user_assistant", "user_id", "assistant_id", unique=True),
         Index(
             "idx_assistant_user_graph_config",
@@ -149,8 +149,10 @@ class Thread(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
-    # Indexes for performance
-    __table_args__ = (Index("idx_thread_user", "user_id"),)
+    # B-tree indexes mirrored for reference. GIN/JSONB indexes are owned by
+    # alembic migrations (hand-written CONCURRENTLY) — migrations are the source
+    # of truth for indexes, not ORM autogenerate.
+    __table_args__ = (Index("idx_thread_user_created", "user_id", text("created_at DESC")),)
 
 
 class ThreadState(Base):
@@ -164,9 +166,7 @@ class ThreadState(Base):
 
     __tablename__ = "thread_state"
 
-    thread_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("thread.thread_id", ondelete="CASCADE"), primary_key=True
-    )
+    thread_id: Mapped[str] = mapped_column(Text, ForeignKey("thread.thread_id", ondelete="CASCADE"), primary_key=True)
     values: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     # Task-keyed interrupts map ({task_id: [...]}) matching the SDK Thread shape.
     interrupts: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
@@ -209,13 +209,19 @@ class Run(Base):
     claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    # Persistent cancel intent. Set by the cancel endpoints; the owning worker's
+    # heartbeat reads it and stops the job even if the pub/sub signal was lost.
+    # Durable and cross-instance — pub/sub is only an accelerator.
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
     # Delayed runs (after_seconds): future timestamp before which the run must
     # not be submitted. NULL means "ready now".
     scheduled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
-    # Indexes for performance
+    # Indexes for performance. idx_runs_thread_created (composite) also serves
+    # the thread_id FK cascade + equality, so no standalone thread_id index.
     __table_args__ = (
-        Index("idx_runs_thread_id", "thread_id"),
+        Index("idx_runs_thread_created", "thread_id", text("created_at DESC")),
         Index("idx_runs_user", "user_id"),
         Index("idx_runs_status", "status"),
         Index("idx_runs_assistant_id", "assistant_id"),
@@ -228,6 +234,12 @@ class Run(Base):
             "thread_id",
             unique=True,
             postgresql_where=text("status = 'running'"),
+        ),
+        # Per-run TTL sweep: terminal rows by age, hot pending/running rows excluded.
+        Index(
+            "idx_runs_ttl_sweep",
+            "updated_at",
+            postgresql_where=text("status IN ('success', 'error', 'interrupted', 'timeout')"),
         ),
     )
 
@@ -262,6 +274,32 @@ class Cron(Base):
         Index("idx_cron_thread_id", "thread_id"),
         Index("idx_cron_next_run", "enabled", "next_run_date"),
     )
+
+
+class WebhookDelivery(Base):
+    """Transactional outbox row for a run-completion webhook.
+
+    Inserted in the same transaction as the run's terminal status, so a durable
+    ``pending`` delivery always exists once a run finalizes — surviving a worker
+    crash. A background deliverer claims, POSTs, and retries with backoff, moving
+    exhausted rows to ``dead`` (dead-letter).
+    """
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
+    run_id: Mapped[str] = mapped_column(Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    # pending → sending → delivered, or → dead once attempts are exhausted.
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
+
+    # Deliverer claim scan: due pending rows by (status, next_attempt_at).
+    __table_args__ = (Index("idx_webhook_deliveries_due", "status", "next_attempt_at"),)
 
 
 # ---------------------------------------------------------------------------

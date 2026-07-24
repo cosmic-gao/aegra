@@ -35,7 +35,7 @@ wheels = [
 
 [[package]]
 name = "aegra-api"
-version = "0.11.2"
+version = "0.12.0"
 source = { editable = "libs/aegra-api" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -56,6 +56,7 @@ dependencies = [
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
+    { name = "orjson" },
     { name = "prometheus-fastapi-instrumentator" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pycryptodome" },
@@ -106,6 +107,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0.60b1" },
     { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.60b1" },
     { name = "opentelemetry-sdk", specifier = ">=1.39.1" },
+    { name = "orjson", specifier = ">=3.11.0" },
     { name = "prometheus-fastapi-instrumentator", specifier = ">=8.0.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.9" },
     { name = "pycryptodome", specifier = ">=3.20.0" },
@@ -138,7 +140,7 @@ dev = [
 
 [[package]]
 name = "aegra-cli"
-version = "0.11.2"
+version = "0.12.0"
 source = { editable = "libs/aegra-cli" }
 dependencies = [
     { name = "aegra-api" },

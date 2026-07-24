@@ -10,12 +10,12 @@ access (instead of deriving from the replay buffer with O(N) LRANGE).
 
 import asyncio
 import contextlib
-import json
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+import orjson
 import structlog
 from redis import RedisError
 
@@ -29,6 +29,8 @@ from aegra_api.utils import generate_event_id
 logger = structlog.getLogger(__name__)
 
 _serializer = GeneralSerializer()
+# Route datetime through the serializer and coerce non-str keys (stdlib-json parity).
+_ORJSON_OPTS = orjson.OPT_PASSTHROUGH_DATETIME | orjson.OPT_NON_STR_KEYS
 
 # TTL for the replay buffer — safety net for runs that crash without cleanup.
 # cleanup_run() deletes the broker on normal completion; this TTL only matters
@@ -47,11 +49,6 @@ _BACKOFF_FACTOR = 2.0
 # block forever, but it should still retry a transient blip rather than drop the
 # event — a dropped event is a permanently lost SSE token.
 _PUT_MAX_ATTEMPTS = 3
-
-
-def _serialize_payload(payload: Any) -> str:
-    """Serialize an event payload to a JSON string for Redis transport."""
-    return json.dumps(payload, default=_serializer.serialize)
 
 
 def _deserialize_payload(raw: Any) -> Any:
@@ -105,11 +102,10 @@ class RedisRunBroker(BaseRunBroker):
             logger.warning(f"Attempted to put event {event_id} into finished broker for run {self.run_id}")
             return
 
-        message = json.dumps(
-            {
-                "event_id": event_id,
-                "payload": json.loads(_serialize_payload(payload)),
-            }
+        # Single orjson pass (was dumps→loads→dumps); the serializer default
+        # handles payload objects orjson can't. Bytes are fine for RPUSH/PUBLISH.
+        message = orjson.dumps(
+            {"event_id": event_id, "payload": payload}, default=_serializer.serialize, option=_ORJSON_OPTS
         )
 
         is_end = isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end"
@@ -137,7 +133,7 @@ class RedisRunBroker(BaseRunBroker):
                 if is_end:
                     self._finished = True
 
-    async def _cache_event(self, message: str) -> None:
+    async def _cache_event(self, message: bytes) -> None:
         """Append the event to the replay buffer and bump the sequence counter."""
         client = redis_manager.get_client()
         pipe = client.pipeline()
@@ -146,14 +142,14 @@ class RedisRunBroker(BaseRunBroker):
         pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
         pipe.incr(self._counter_key)
         pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
-        await pipe.execute()  # type: ignore[invalid-await]
+        await pipe.execute()
 
-    async def _publish_event(self, message: str) -> None:
+    async def _publish_event(self, message: bytes) -> None:
         """Broadcast the event to live subscribers."""
         client = redis_manager.get_client()
         await client.publish(self._channel, message)
 
-    async def _write_with_retry(self, op: Callable[[str], Awaitable[None]], message: str) -> None:
+    async def _write_with_retry(self, op: Callable[[bytes], Awaitable[None]], message: bytes) -> None:
         """Run a Redis write with bounded exponential backoff.
 
         Mirrors the retry/backoff the read path (aiter) already applies, so a
@@ -220,7 +216,7 @@ class RedisRunBroker(BaseRunBroker):
                 if message["type"] != "message":
                     continue
 
-                data = json.loads(message["data"])
+                data = orjson.loads(message["data"])
                 event_id: str = data["event_id"]
 
                 # Drop an at-least-once republish (put() retries a transient
@@ -252,7 +248,7 @@ class RedisRunBroker(BaseRunBroker):
             client = redis_manager.get_client()
             raw_messages = await client.lrange(self._cache_key, -1, -1)  # type: ignore[invalid-await]
             if raw_messages:
-                data = json.loads(raw_messages[0])
+                data = orjson.loads(raw_messages[0])
                 payload = _deserialize_payload(data["payload"])
                 if isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end":
                     self._finished = True
@@ -277,7 +273,7 @@ class RedisRunBroker(BaseRunBroker):
         found_last = last_event_id is None
         prev_event_id: str | None = None
         for raw in raw_messages:
-            data = json.loads(raw)
+            data = orjson.loads(raw)
             event_id: str = data["event_id"]
 
             # Skip an adjacent duplicate: put() retries are at-least-once, so a
@@ -299,8 +295,15 @@ class RedisRunBroker(BaseRunBroker):
 
             events_after.append((event_id, payload))
 
-        # If last_event_id was not found in the buffer, return all events
+        # Cursor evicted (TTL/LTRIM) — the client's events between its cursor and
+        # the oldest survivor are gone. Surface the gap; can't dedup without it.
         if not found_last:
+            logger.warning(
+                "Replay cursor evicted; resuming from oldest survivor (events may be missed)",
+                run_id=self.run_id,
+                last_event_id=last_event_id,
+                survivors=len(all_events),
+            )
             return all_events
 
         return events_after
@@ -377,7 +380,7 @@ class RedisBrokerManager(BaseBrokerManager):
 
     async def request_cancel(self, run_id: str, action: str = "cancel") -> None:
         """Broadcast a cancel command via Redis pub/sub."""
-        message = json.dumps({"run_id": run_id, "action": action})
+        message = orjson.dumps({"run_id": run_id, "action": action})
         try:
             client = redis_manager.get_client()
             await client.publish(self._cancel_channel, message)
@@ -392,7 +395,7 @@ class RedisBrokerManager(BaseBrokerManager):
         """Read the current event sequence counter from Redis (O(1) GET)."""
         try:
             client = redis_manager.get_client()
-            value = await client.get(f"{self._counter_prefix}{run_id}")  # type: ignore[invalid-await]
+            value = await client.get(f"{self._counter_prefix}{run_id}")
             if value is not None:
                 return int(value)
         except (RedisError, ValueError) as e:
@@ -409,8 +412,8 @@ class RedisBrokerManager(BaseBrokerManager):
         counter_key = f"{self._counter_prefix}{run_id}"
         try:
             client = redis_manager.get_client()
-            seq = await client.incr(counter_key)  # type: ignore[invalid-await]
-            await client.expire(counter_key, _REPLAY_TTL_SECONDS)  # type: ignore[invalid-await]
+            seq = await client.incr(counter_key)
+            await client.expire(counter_key, _REPLAY_TTL_SECONDS)
             return generate_event_id(run_id, int(seq))
         except RedisError as e:
             logger.warning(f"Failed to allocate event_id for run {run_id}: {e}")
@@ -453,9 +456,9 @@ class RedisBrokerManager(BaseBrokerManager):
                     continue
 
                 try:
-                    data = json.loads(message["data"])
+                    data = orjson.loads(message["data"])
                     await self._execute_cancel(data["run_id"])
-                except (json.JSONDecodeError, KeyError) as e:
+                except (orjson.JSONDecodeError, KeyError) as e:
                     logger.warning(f"Invalid cancel message: {e}")
         finally:
             await pubsub.unsubscribe(self._cancel_channel)

@@ -8,6 +8,7 @@ import structlog
 
 from aegra_api.core.sse import create_error_event
 from aegra_api.models import Run
+from aegra_api.models.enums import TERMINAL_RUN_STATUSES
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_converter import EventConverter
 from aegra_api.utils import extract_event_sequence
@@ -146,7 +147,7 @@ class StreamingService:
         # If run is in a terminal state and broker is either missing or finished,
         # there are no live events to stream. Using get_broker (not get_or_create)
         # avoids creating a blank broker that would hang forever in aiter().
-        if run.status in ["success", "error", "interrupted"] and (broker is None or broker.is_finished()):
+        if run.status in TERMINAL_RUN_STATUSES and (broker is None or broker.is_finished()):
             return
 
         if broker is None:

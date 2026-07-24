@@ -20,6 +20,10 @@ ThreadStatus = Literal[
     "error",
 ]
 
+# Single source of truth for terminal run states, so waiters/streaming/executor
+# and finalize's compare-and-set can't drift (dropping "timeout" would hang /join).
+TERMINAL_RUN_STATUSES: frozenset[str] = frozenset({"success", "error", "interrupted", "timeout"})
+
 # Multitask strategy enum
 MultitaskStrategy = Literal[
     "reject",

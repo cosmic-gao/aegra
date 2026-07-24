@@ -138,8 +138,9 @@ Key details:
 
 1. **Execution params** are stored in PostgreSQL alongside the run, so any worker can reconstruct the full job context (user identity, config, trace metadata, interrupt settings, etc.).
 2. **Lease acquisition** is atomic — `UPDATE ... WHERE claimed_by IS NULL` ensures only one worker wins the race.
-3. **Heartbeats** extend the lease every 10 seconds. If a worker crashes, the lease expires and the run becomes eligible for recovery.
+3. **Heartbeats** extend the lease every 10 seconds (by the DB clock), and read the `cancel_requested` marker in the same round-trip. If a worker crashes, the lease expires and the run becomes eligible for recovery.
 4. **OpenTelemetry trace context** propagates across the Redis queue boundary, so traces span the full request lifecycle.
+5. **Thread state** is materialized from the checkpointer snapshot (`graph.aget_state()`), the single source of truth — never from the run's stream output, which is empty under non-`values` stream modes. The stream output still populates `run.output` (a separate field); only the materialized thread state comes from the checkpointer.
 
 ### Streaming run with crash recovery
 
@@ -221,26 +222,61 @@ sequenceDiagram
 
 The reaper runs on every instance (default every 15 seconds). This is safe — the atomic lease acquisition prevents duplicate execution.
 
+Lease timing uses the **database clock** (`now()`), not each pod's wall clock: the expiry is written as `now() + interval` and the reaper compares against `now()` on the DB server. With per-pod wall clocks, a reaper whose clock ran fast could reclaim a lease that was still valid on the writer's timeline — briefly double-running the run. Deriving both the write and the comparison from one authoritative clock removes that window.
+
+## Graceful shutdown (rolling upgrades)
+
+On `SIGTERM` (K8s rolling upgrade, scale-down), each instance drains its in-flight jobs for up to `WORKER_DRAIN_TIMEOUT` seconds. A job that finishes within the window completes normally. A job still running after it is **handed off, not killed**: the instance reverts the run from `running` back to `pending` (clearing the lease) and re-enqueues it, so another instance resumes it from the last checkpoint.
+
+Crucially, a drained run is **not** written as terminal `interrupted`. The reaper only recovers `running` rows with expired leases, so an `interrupted` row would be a dead end — the in-flight work would be lost on every deploy. Reverting to `pending` keeps it recoverable (immediately via the re-enqueue, or via the reaper's stuck-pending sweep as a backstop). No retry budget is charged, since a deploy is not a failure.
+
+<a href="https://mermaid.live/view#pako:eNptku9KKzEQxV9lyKcK7QssKOxi6S1Vu6aVBVkoMZluo9lkTSZeLuK7m9xuoVLzIeTP78w5Q_LJpFPIChbwPaKVeKtF50XfWkhjEJ601IOwBCsQAVbxBb1FwnAJNGUmljaQSHWghInyQlttu6tLuF5kuHaBOo-bx7tLgmeAo9K_WVU_rKrWHpnV7OamKQvYLBfbOb-HiXfGpAAQh9SUwjHIgyME94EeMvw_JWg72xvdHQhe3UuASbPmqznf3fJy-bDbLu_n66ftKG_K0UZmd3MUBNLGgI82N3zG1YsCPCYvSoigGK5HBsjBgFal5RSkQeEhTQHPtLwAXj9t_uSyO61SOzhDm94pnjppqiNW3dXr-njEZzldVYyiMy5HEfI9ao9g8e8Pu-okwhB7hL13PcgDyrfBaUtsynr0vdAq_ZTPLGkZHbDHlhVpqXAvoqGWtfYroSKS2_yzkhXkI05ZHJSg08c6HXoXuwMr9sKEtEuv-uzcePn1DcLM2FE=" target="_blank" rel="noopener">View fullscreen ↗</a>
+
+```mermaid
+sequenceDiagram
+    participant K as Kubernetes
+    participant WA as Instance A (draining)
+    participant PG as PostgreSQL
+    participant R as Redis
+    participant WB as Instance B
+
+    K->>WA: SIGTERM (rolling upgrade)
+    Note over WA: drain in-flight jobs (WORKER_DRAIN_TIMEOUT)
+    WA->>WA: cancel jobs still running
+    WA->>PG: revert status=running to pending, clear lease
+    WA->>R: RPUSH run_id (re-enqueue)
+    WB->>R: BLPOP
+    R-->>WB: run_id
+    WB->>PG: acquire new lease
+    WB->>WB: resume from checkpoint
+```
+
 ## Cross-instance cancellation
 
-Cancel requests can arrive at any instance, but the run may be executing on a different one. Aegra uses Redis pub/sub to propagate cancellation across instances.
+Cancel requests can arrive at any instance, but the run may be executing on a different one. Cancellation is **durable**: the API persists the intent to a `cancel_requested` column on the run, and the owning worker's heartbeat reads that flag in the same round-trip it already makes to extend its lease (every ~10s). So a cancel is honored even if the Redis pub/sub signal is dropped — and even survives a worker crash, since the reaper re-enqueues the run with the marker intact. Redis pub/sub is kept as an **accelerator** for near-instant cancellation on the fast path.
 
-<a href="https://mermaid.live/view#pako:eNplkc1qwzAQhF9l0SmG_oQeBQ1YTkgDhrp2cstFsRZXSSy7khwoxu_edUWbBOs6386MdntWNgoZB-bwq0NT4lLLysp6b4BeK63XpW6l8ZCAdJCcNRo_FeNR3BjnJVlAPAXyEchRaTfVsvUoZo3zlcXiI50S4s5ewMx2xmhTgf9EODaHaG_CUPK4WMQcsvdiC8_lSJ8JbjqPCg7fkIoocDFxOXE7kW6KN5BIf-ZkysPMFcrWHHbZMt6ugNJ951718Wht15JlwHLCBIckpNXonKwQLJaoL3-MCIyX7vQUImbRVblpgkYBXv53PFZIOLzM59CHfA43BQb2AKxGW0ut6Ig9o33Uv-dU0p7YMPwA02SZhQ==" target="_blank" rel="noopener">View fullscreen ↗</a>
+The **executor**, not the API, writes the terminal `interrupted` status. This closes a race the old pub/sub-only path had: a dropped message let the run finish and overwrite `interrupted` back to `success`. Because the marker guarantees the worker self-cancels, the worker is always the one to finalize.
+
+`wait=1` and `rollback` block on the executor's own settle signal — **terminal status AND lease released** (`claimed_by IS NULL`) — not on a status the API pre-wrote. A prod worker writes the terminal status in `finalize_run` but only drops its lease afterwards, so the lease-release is the definitive "worker is fully done" point. This is what makes `rollback` safe: checkpoints are deleted only after the worker has stopped touching them.
+
+<a href="https://mermaid.live/view#pako:eNplkl9r2zAUxb_KRU8pS9Zsj4IW7GR0hdB5SfsyDOPavna0yZKnP4MudJ99V7XDUuwHW_j-zjm6VzqJ2jYkpPD0K5Kpaauwc9iXBvgZ0AVVqwFNgA2gh41WZMK8mKXivfEB2QKyOVDcJaKwPnSODl93c2KfgD01ys9r-Rv7HBYuGqNMB-FI8MNWV6UZRZvV7W0mofhyeITrOtGaYRsDNVA9wy6_GrmMueJOwlOxzR4_wUh-d2kGntmb4CLBookOK02gTOCuL6R7jnjKd_eHz4DE45K8H3mOw5o_5DBYN0n2K9bkcoqBnrzHjv1b9IH7DMeJe7CBwP4mBwyT9gRH4ilUhAEcYeNnG4XF3w9rv4QhVtc-VqvWEU1m-ZgZ0P98P8oWF5XUfKsMavWHgOcaor9JbToXh-T7jgM1IW_h9f12aoPVGqIJSgMr-mQD2cN2RM_C5r9mI-Hjeg2nMUfCRdCLWIqePVA1fAlPSVMKPtWeSiF52VCLUYdSlCahGIM9PJtayHRCSxGHBsP5zp5_8nl3RyFb5AkuBV-gb9ZOxZd_RtH48A==" target="_blank" rel="noopener">View fullscreen ↗</a>
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant A as Instance A
-    participant R as Redis
     participant PG as PostgreSQL
+    participant R as Redis
     participant B as Instance B (running the job)
 
     C->>A: POST /cancel (routed by LB)
-    A->>R: PUBLISH aegra:run:cancel
-    A->>PG: UPDATE status=interrupted
-    R->>B: Cancel message received
+    A->>PG: UPDATE cancel_requested=true (durable intent)
+    A->>R: PUBLISH aegra:run:cancel (accelerator)
+    R-->>B: cancel message (fast path)
+    Note over B: else heartbeat reads cancel_requested (~10s, pub/sub-free)
     B->>B: task.cancel()
-    B->>R: PUBLISH end event
+    B->>PG: finalize status=interrupted + release lease
+    A->>PG: poll until terminal AND lease released
     A->>C: 200 {status: interrupted}
 ```
 
@@ -267,8 +303,12 @@ sequenceDiagram
 | `aegra:run:{run_id}` | SSE live events | Worker (PUBLISH) | API (SUBSCRIBE) |
 | `aegra:run:cache:{run_id}` | SSE replay buffer | Worker (RPUSH) | API (LRANGE) |
 | `aegra:run:counter:{run_id}` | Event sequence counter | Worker (INCR) | API (GET) |
-| `aegra:run:cancel` | Cancel commands | API (PUBLISH) | Worker (SUBSCRIBE) |
+| `aegra:run:cancel` | Cancel commands (accelerator only) | API (PUBLISH) | Worker (SUBSCRIBE) |
 | `aegra:run:done:{run_id}` | Completion signal (TTL 1h) | Worker (SET) | API (EXISTS) |
+
+<Note>
+  The durable source of truth for cancellation is the `runs.cancel_requested` column in Postgres, read by the worker heartbeat — not the `aegra:run:cancel` pub/sub channel, which only accelerates the fast path.
+</Note>
 
 ## Configuration
 
@@ -309,6 +349,6 @@ All worker settings are configured via environment variables. See the [environme
 | `services/redis_broker.py` | Redis pub/sub broker for SSE |
 | `services/streaming_service.py` | SSE orchestration (replay + live) |
 | `models/run_job.py` | `RunJob` Pydantic model (serialized execution params) |
-| `core/orm.py` | Run table with `execution_params`, `claimed_by`, `lease_expires_at` |
+| `core/orm.py` | Run table with `execution_params`, `claimed_by`, `lease_expires_at`, `cancel_requested` |
 | `core/active_runs.py` | In-memory task registry (dev mode only) |
 | `core/redis_manager.py` | Redis connection pool singleton |

@@ -5,11 +5,15 @@ graph) rather than the old generic ``list_assistants``/``run_assistant`` pair.
 """
 
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 import structlog
+from fastapi import HTTPException
+from langgraph_sdk import Auth
 from mcp import types
 
 import aegra_api.services.mcp_server as mcp_server
@@ -47,7 +51,9 @@ class _FakeService:
         return self._graph
 
     @asynccontextmanager
-    async def get_graph(self, name: str, user: User | None = None):
+    async def get_graph(
+        self, name: str, *, config: dict | None = None, user: User | None = None, context: dict | None = None
+    ) -> AsyncIterator[_FakeGraph]:
         yield self._graph
 
 
@@ -147,7 +153,9 @@ async def test_call_tool_binds_langfuse_trace_context(auth) -> None:
 
     class _CapturingService(_FakeService):
         @asynccontextmanager
-        async def get_graph(self, name: str, user: User | None = None):
+        async def get_graph(
+            self, name: str, *, config: dict | None = None, user: User | None = None, context: dict | None = None
+        ) -> AsyncIterator[_CapturingGraph]:
             yield _CapturingGraph()
 
     with patch.object(mcp_server, "get_langgraph_service", return_value=_CapturingService(("weather",))):
@@ -180,3 +188,70 @@ async def test_transport_dispatch_uses_per_graph_handler(auth) -> None:
 async def test_authenticate_without_http_context_raises() -> None:
     with pytest.raises(ValueError, match="no HTTP context"):
         await mcp_server._authenticate()
+
+
+async def test_call_tool_denies_when_auth_handler_rejects(auth) -> None:
+    """A denying @auth.on.threads.create_run handler blocks MCP before the graph runs.
+
+    Before this fix the MCP tool path only authenticated, so create_run authorization
+    (enforced on the REST path) was silently bypassed here.
+    """
+    denier = Auth()
+
+    @denier.on.threads.create_run
+    async def _deny(*, ctx: Any, value: Any) -> bool:
+        return False
+
+    with (
+        patch.object(mcp_server, "get_langgraph_service", return_value=_FakeService(("weather",))),
+        patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=denier),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await mcp_server._call_tool("weather", {"messages": ["hi"]})
+
+    assert exc_info.value.status_code == 403
+    assert _trace_attrs.get() is None  # rejected before trace binding
+
+
+async def test_call_tool_applies_auth_handler_config_and_context(auth) -> None:
+    """An allowing handler's config/context reach the inline MCP graph run (was bypassed).
+
+    Mirrors api/runs.create_run: injected config merges into the run config and the
+    server-generated thread_id stays authoritative.
+    """
+    injector = Auth()
+
+    @injector.on.threads.create_run
+    async def _inject(*, ctx: Any, value: Any) -> dict[str, Any]:
+        return {"config": {"configurable": {"tenant": ctx.user.identity}}, "context": {"scope": "team"}}
+
+    seen: dict[str, Any] = {}
+
+    class _CapturingGraph:
+        def get_input_jsonschema(self) -> dict:
+            return {"type": "object"}
+
+        async def ainvoke(self, input: dict, config: dict) -> dict:
+            seen["invoke_config"] = config
+            return {"messages": ["done"]}
+
+    class _CapturingService(_FakeService):
+        @asynccontextmanager
+        async def get_graph(
+            self, name: str, *, config: dict | None = None, user: User | None = None, context: dict | None = None
+        ) -> AsyncIterator[_CapturingGraph]:
+            seen["graph_config"] = config
+            seen["graph_context"] = context
+            yield _CapturingGraph()
+
+    with (
+        patch.object(mcp_server, "get_langgraph_service", return_value=_CapturingService(("weather",))),
+        patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=injector),
+    ):
+        await mcp_server._call_tool("weather", {"messages": ["hi"]})
+
+    invoke_config = seen["invoke_config"]
+    assert invoke_config["configurable"]["tenant"] == "u1"
+    assert invoke_config["configurable"]["thread_id"]  # server thread_id preserved
+    assert seen["graph_config"]["configurable"]["tenant"] == "u1"
+    assert seen["graph_context"] == {"scope": "team"}

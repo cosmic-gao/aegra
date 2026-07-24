@@ -86,6 +86,39 @@ PHOENIX_COLLECTOR_ENDPOINT=http://127.0.0.1:6006/v1/traces
 
 Each backend receives the same trace data through separate `BatchSpanProcessor` instances.
 
+### Redacting LLM inputs and outputs (PII)
+
+By default, auto-instrumentation exports the full LLM payload — prompts, completions, end-user messages, and tool-call arguments — to every configured backend. In multi-tenant or regulated deployments this is the largest PII/compliance surface. Two switches redact it at the source, before any span leaves the process:
+
+```bash
+# Replace LLM prompts / input messages with a redacted marker
+OTEL_HIDE_LLM_INPUTS=true
+# Replace LLM completions / output messages with a redacted marker
+OTEL_HIDE_LLM_OUTPUTS=true
+```
+
+These map to OpenInference's `TraceConfig(hide_inputs=…)` / `hide_outputs=…`, which redact the input/output values, prompt/completion messages, and tool arguments while leaving span structure, timing, token counts, and metadata intact.
+
+Both default to `false` to preserve existing behavior. A `false` switch does **not** force redaction off — it defers to OpenInference's native `OPENINFERENCE_HIDE_INPUTS` / `OPENINFERENCE_HIDE_OUTPUTS` environment variables, so any redaction you already rely on keeps working. Setting a switch to `true` always redacts, regardless of those env vars.
+
+<Note>
+**User and session identifiers are always attached.** Even with redaction on, every span still carries `user.id` / `langfuse.user.id` and `session.id` / `langfuse.session.id` (set in `observability/span_enrichment.py`). This is a deliberate identity annotation — Langfuse user/session analytics depend on it. These are opaque identifiers (the authenticated identity and the thread id), not message content.
+</Note>
+
+### Sampling
+
+By default every trace is exported (the SDK default is `parentbased_always_on`). At high request volume you can export only a fraction of traces to cut client cost and backend ingestion, using the standard OpenTelemetry sampler variables:
+
+```bash
+# Export ~10% of runs; respect an upstream sampling decision when one is present
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+Supported samplers: `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio`. `OTEL_TRACES_SAMPLER_ARG` is the sampling ratio (`0.0`–`1.0`) and applies only to the ratio-based samplers. Leaving `OTEL_TRACES_SAMPLER` empty keeps the default (export everything); an unknown name or an out-of-range ratio is ignored with a warning and also falls back to the default.
+
+Because a run's trace id is derived deterministically from its `run_id` (see [Trace identity](#trace-identity)), ratio sampling is **consistent per run**: every span in a run shares one trace id and therefore one sampling decision, so a run's trace is never partially sampled — you never get orphaned child spans. When trace context crosses the Redis worker boundary, prefer a `parentbased_*` sampler so the whole distributed trace inherits the root's decision.
+
 ## How it works
 
 Aegra uses a pure OpenTelemetry approach:
@@ -168,6 +201,10 @@ The main variables you'll need:
 | `OTEL_TARGETS` | Comma-separated list of backends: `LANGFUSE`, `PHOENIX`, `GENERIC` |
 | `OTEL_SERVICE_NAME` | Service name for traces (default: `aegra-backend`) |
 | `OTEL_CONSOLE_EXPORT` | Log traces to console (`true`/`false`) |
+| `OTEL_HIDE_LLM_INPUTS` | Redact LLM prompts / input messages before export (`true`/`false`, default `false`) |
+| `OTEL_HIDE_LLM_OUTPUTS` | Redact LLM completions / output messages before export (`true`/`false`, default `false`) |
+| `OTEL_TRACES_SAMPLER` | Trace sampler: `always_on`, `traceidratio`, `parentbased_traceidratio`, … (empty = export all) |
+| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio `0.0`–`1.0` for ratio-based samplers (default `1.0`) |
 
 Each provider has its own set of variables (endpoints, API keys). See the [environment variables reference](/reference/environment-variables) for the full list including all Langfuse, Phoenix, and generic OTLP variables.
 

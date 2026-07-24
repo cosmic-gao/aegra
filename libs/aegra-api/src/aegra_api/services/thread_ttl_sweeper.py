@@ -68,41 +68,38 @@ class ThreadTTLSweeper:
 
     async def _tick(self) -> None:
         cutoff = datetime.now(UTC) - timedelta(minutes=settings.checkpointer.CHECKPOINTER_TTL_MINUTES)
-        stale = await self._find_stale(cutoff)
-        if not stale:
-            return
-        logger.info("Sweeping stale threads", count=len(stale))
-        checkpointer = db_manager.get_checkpointer()
-        for thread_id in stale:
-            await self._delete_thread(thread_id, checkpointer)
-
-    @staticmethod
-    async def _find_stale(cutoff: datetime) -> list[str]:
         active = (
             select(RunORM.run_id)
             .where(RunORM.thread_id == ThreadORM.thread_id, RunORM.status.in_(_ACTIVE_STATUSES))
             .exists()
         )
+        checkpointer = db_manager.get_checkpointer()
         maker = _get_session_maker()
+        # Claim + delete in one transaction: FOR UPDATE SKIP LOCKED holds the row
+        # locks to commit, so concurrent replicas sweep disjoint threads.
         async with maker() as session:
             rows = await session.scalars(
                 select(ThreadORM.thread_id)
                 .where(ThreadORM.updated_at < cutoff, ~active)
                 .limit(settings.checkpointer.CHECKPOINTER_SWEEP_BATCH_SIZE)
+                .with_for_update(skip_locked=True, of=ThreadORM)
             )
-            return list(rows.all())
+            stale = list(rows.all())
+            if not stale:
+                return
+            logger.info("Sweeping stale threads", count=len(stale))
+            for thread_id in stale:
+                await self._delete_checkpoints(thread_id, checkpointer)
+            # Deleting the thread rows cascades to their runs (FK ON DELETE CASCADE).
+            await session.execute(delete(ThreadORM).where(ThreadORM.thread_id.in_(stale)))
+            await session.commit()
 
     @staticmethod
-    async def _delete_thread(thread_id: str, checkpointer: Any) -> None:
+    async def _delete_checkpoints(thread_id: str, checkpointer: Any) -> None:
         try:
             await checkpointer.adelete_thread(thread_id)
         except Exception as exc:
             logger.warning("Failed to delete checkpoints for stale thread", thread_id=thread_id, error=str(exc))
-        # Deleting the thread row cascades to its runs (FK ON DELETE CASCADE).
-        maker = _get_session_maker()
-        async with maker() as session:
-            await session.execute(delete(ThreadORM).where(ThreadORM.thread_id == thread_id))
-            await session.commit()
 
 
 thread_ttl_sweeper = ThreadTTLSweeper()

@@ -1,13 +1,28 @@
 """Unit tests for standard run endpoints (create, get, list, update, join)."""
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from langgraph_sdk import Auth
 
-from aegra_api.api.runs import create_run, get_run, join_run, list_runs, update_run
+from aegra_api.api.runs import (
+    _authorize_run_creation,
+    _interrupt_pending,
+    _mark_cancel_requested,
+    _wait_for_settle,
+    cancel_run_endpoint,
+    create_and_stream_run,
+    create_run,
+    get_run,
+    join_run,
+    list_runs,
+    update_run,
+    wait_for_run,
+)
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
@@ -380,6 +395,194 @@ class TestRunsEndpoints:
         assert "Location" in response.headers
 
 
+class TestCancelDurability:
+    """P0-5: cancellation is persisted (a durable marker) and the wait keys off
+    the executor's own settle signal — so a lost pub/sub message can neither leave
+    a run running nor let a finalize overwrite 'interrupted' back to 'success'."""
+
+    @pytest.fixture
+    def mock_user(self) -> User:
+        return User(identity="test-user", scopes=[])
+
+    @pytest.mark.asyncio
+    async def test_mark_cancel_requested_persists_flag(self) -> None:
+        session = AsyncMock()
+        await _mark_cancel_requested(session, ["run-1"])
+
+        session.execute.assert_awaited_once()
+        session.commit.assert_awaited_once()
+        assert True in session.execute.await_args.args[0].compile().params.values()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_pending_is_guarded_on_pending_status(self) -> None:
+        # Only an unclaimed pending run is finalized by the API; a running run is
+        # left to its executor. The guard lives in the WHERE clause.
+        session = AsyncMock()
+        await _interrupt_pending(session, ["run-1"])
+
+        params = list(session.execute.await_args.args[0].compile().params.values())
+        assert "interrupted" in params
+        assert "pending" in params
+
+    @pytest.mark.asyncio
+    async def test_wait_for_settle_waits_for_lease_release(self) -> None:
+        # Terminal status alone is insufficient — claimed_by must be NULL (worker
+        # released the lease) before rollback may delete checkpoints.
+        session = AsyncMock()
+        still_leased = MagicMock()
+        still_leased.all.return_value = [("interrupted", "worker-0")]
+        released = MagicMock()
+        released.all.return_value = [("interrupted", None)]
+        session.execute = AsyncMock(side_effect=[still_leased, released])
+
+        with patch("aegra_api.api.runs.asyncio.sleep", new_callable=AsyncMock):
+            await _wait_for_settle(session, ["run-1"], attempts=5, delay=0)
+
+        assert session.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_wait_for_settle_does_not_break_on_api_written_status(self) -> None:
+        # Regression: the old bug broke on the first poll because it saw the status
+        # the API itself wrote. Terminal + still-leased must keep waiting.
+        session = AsyncMock()
+        leased = MagicMock()
+        leased.all.return_value = [("interrupted", "worker-0")]
+        session.execute = AsyncMock(return_value=leased)
+
+        with patch("aegra_api.api.runs.asyncio.sleep", new_callable=AsyncMock):
+            await _wait_for_settle(session, ["run-1"], attempts=3, delay=0)
+
+        # Ran the full bounded budget — never falsely settled
+        assert session.execute.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_cancel_endpoint_marks_and_does_not_blindly_interrupt_running(self, mock_user: User) -> None:
+        # A running run is settled by its executor; the endpoint sets the durable
+        # marker and only interrupts the run if it is still pending.
+        run_orm = RunORM(
+            run_id="run-1",
+            thread_id="t",
+            assistant_id="agent",
+            user_id=mock_user.identity,
+            status="running",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session = AsyncMock()
+        session.scalar = AsyncMock(side_effect=[run_orm, run_orm])
+        session.execute = AsyncMock()
+        session.commit = AsyncMock()
+        session.expire_all = MagicMock()
+
+        with patch("aegra_api.api.runs.streaming_service.interrupt_run", new_callable=AsyncMock) as mock_interrupt:
+            result = await cancel_run_endpoint("t", "run-1", 0, "interrupt", mock_user, session)
+
+        mock_interrupt.assert_awaited_once_with("run-1")
+        flat = [v for call in session.execute.await_args_list for v in call.args[0].compile().params.values()]
+        assert True in flat  # cancel_requested marker set
+        assert "pending" in flat  # interrupt guarded on status='pending', not blind
+        assert result.run_id == "run-1"
+
+
 # Note: _resolve_context was removed from runs.py during the worker architecture
 # refactor — context resolution is now handled in services/run_preparation.py.
 # The equivalent tests live in tests/unit/test_services/.
+
+
+class TestRunCreationAuthorization:
+    """P0-2: every run-creation entrypoint dispatches ``@auth.on.threads.create_run``.
+
+    Before this fix only the plain ``create_run`` path authorized; ``create_and_stream_run``
+    and ``wait_for_run`` (and the stateless wrappers that delegate to them) skipped it, so an
+    operator's create_run policy was silently bypassed on those routes.
+    """
+
+    @pytest.fixture
+    def mock_user(self) -> User:
+        return User(identity="u1", scopes=[])
+
+    @staticmethod
+    def _maker_no_thread() -> MagicMock:
+        """Session-maker whose session sees no existing thread (ownership check passes)."""
+        session = AsyncMock()
+        session.scalar = AsyncMock(return_value=None)
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return MagicMock(return_value=cm)
+
+    @pytest.mark.asyncio
+    async def test_authorize_denies(self, mock_user: User) -> None:
+        auth = Auth()
+
+        @auth.on.threads.create_run
+        async def _deny(*, ctx: Any, value: Any) -> bool:
+            return False
+
+        request = RunCreate(assistant_id="a", input={})
+        with patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=auth):  # noqa: SIM117
+            with pytest.raises(HTTPException) as exc:
+                await _authorize_run_creation(mock_user, request, "t1")
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_authorize_injects_config_and_context(self, mock_user: User) -> None:
+        auth = Auth()
+
+        @auth.on.threads.create_run
+        async def _inject(*, ctx: Any, value: Any) -> dict[str, Any]:
+            return {"config": {"configurable": {"tenant": ctx.user.identity}}, "context": {"scope": "team"}}
+
+        request = RunCreate(assistant_id="a", input={}, config={"configurable": {"a": 1}}, context={"b": 1})
+        with patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=auth):
+            await _authorize_run_creation(mock_user, request, "t1")
+
+        assert request.config["configurable"]["tenant"] == "u1"
+        assert request.context["scope"] == "team"
+
+    @pytest.mark.asyncio
+    async def test_authorize_noop_without_handler(self, mock_user: User) -> None:
+        # default-allow: an empty registry neither raises nor mutates the request.
+        request = RunCreate(assistant_id="a", input={}, config={"x": 1})
+        with patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=Auth()):
+            await _authorize_run_creation(mock_user, request, "t1")
+        assert request.config == {"x": 1}
+
+    @pytest.mark.asyncio
+    async def test_stream_run_denied_before_prepare(self, mock_user: User) -> None:
+        auth = Auth()
+
+        @auth.on.threads.create_run
+        async def _deny(*, ctx: Any, value: Any) -> bool:
+            return False
+
+        request = RunCreate(assistant_id="a", input={})
+        with (
+            patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=auth),
+            patch("aegra_api.api.runs._get_session_maker", return_value=self._maker_no_thread()),
+            patch("aegra_api.api.runs._prepare_run", new_callable=AsyncMock) as prep,
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_and_stream_run("t1", request, mock_user)
+        assert exc.value.status_code == 403
+        prep.assert_not_awaited()  # denied before the run is created
+
+    @pytest.mark.asyncio
+    async def test_wait_run_denied_before_prepare(self, mock_user: User) -> None:
+        auth = Auth()
+
+        @auth.on.threads.create_run
+        async def _deny(*, ctx: Any, value: Any) -> bool:
+            return False
+
+        request = RunCreate(assistant_id="a", input={})
+        with (
+            patch("aegra_api.core.auth_handlers.get_auth_instance", return_value=auth),
+            patch("aegra_api.api.runs._get_session_maker", return_value=self._maker_no_thread()),
+            patch("aegra_api.api.runs._prepare_run", new_callable=AsyncMock) as prep,
+            pytest.raises(HTTPException) as exc,
+        ):
+            await wait_for_run("t1", request, mock_user)
+        assert exc.value.status_code == 403
+        prep.assert_not_awaited()

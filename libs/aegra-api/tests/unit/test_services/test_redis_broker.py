@@ -4,35 +4,34 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import orjson
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from aegra_api.services.redis_broker import (
+    _ORJSON_OPTS,
     _PUT_MAX_ATTEMPTS,
     RedisBrokerManager,
     RedisRunBroker,
     _deserialize_payload,
-    _serialize_payload,
+    _serializer,
 )
 
 
 class TestSerializationHelpers:
     """Test serialization/deserialization helpers"""
 
-    def test_serialize_payload_simple_tuple(self) -> None:
-        result = _serialize_payload(("values", {"key": "value"}))
-        parsed = json.loads(result)
-        assert parsed == ["values", {"key": "value"}]
-
-    def test_serialize_payload_end_event(self) -> None:
-        result = _serialize_payload(("end", {"status": "success"}))
-        parsed = json.loads(result)
-        assert parsed == ["end", {"status": "success"}]
-
-    def test_serialize_payload_dict(self) -> None:
-        result = _serialize_payload({"data": "test"})
-        parsed = json.loads(result)
-        assert parsed == {"data": "test"}
+    def test_envelope_round_trips_tuple_payload(self) -> None:
+        # put() encodes the {event_id, payload} envelope in a single orjson pass;
+        # a tuple payload rides the wire as a list and is rebuilt by _deserialize_payload.
+        encoded = orjson.dumps(
+            {"event_id": "e1", "payload": ("values", {"key": "value"})},
+            default=_serializer.serialize,
+            option=_ORJSON_OPTS,
+        )
+        data = orjson.loads(encoded)
+        assert data["event_id"] == "e1"
+        assert _deserialize_payload(data["payload"]) == ("values", {"key": "value"})
 
     def test_deserialize_payload_converts_list_to_tuple(self) -> None:
         result = _deserialize_payload(["values", {"key": "value"}])

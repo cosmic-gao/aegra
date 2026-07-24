@@ -1,11 +1,27 @@
 """Tests for the v2 wire envelope builders."""
 
-from aegra_api.services.event_streaming.channels import is_supported_channel
+import typing
+
+import langchain_protocol as lp
+
+from aegra_api.services.event_streaming.channels import SUPPORTED_CHANNELS, is_supported_channel
 from aegra_api.services.event_streaming.protocol import (
+    ErrorCode,
     build_error,
     build_event,
     build_success,
 )
+
+
+def _literal_members(tp: object) -> set[str]:
+    """Flatten a Union-of-Literal (with an optional Annotated[str] arm) to its strings."""
+    members: set[str] = set()
+    for arm in typing.get_args(tp):
+        if isinstance(arm, str):
+            members.add(arm)
+            continue
+        members.update(a for a in typing.get_args(arm) if isinstance(a, str))
+    return members
 
 
 class TestBuildEvent:
@@ -73,3 +89,28 @@ class TestChannels:
 
     def test_unknown_channel_rejected(self) -> None:
         assert not is_supported_channel("bogus")
+
+
+class TestProtocolConformance:
+    """Pin aegra's channel/error-code sets to the official langchain_protocol types."""
+
+    def test_supported_channels_match_official_channel_literals(self) -> None:
+        # ``custom:.+`` is the free-form arm, handled separately by is_supported_channel.
+        official = _literal_members(lp.Channel) - {"custom:.+"}
+        assert official == SUPPORTED_CHANNELS
+
+    def test_error_code_reuses_official_type(self) -> None:
+        assert ErrorCode is lp.ErrorCode
+
+    def test_emitted_error_codes_stay_valid_in_official_set(self) -> None:
+        official = _literal_members(lp.ErrorCode)
+        emitted = {
+            "invalid_argument",
+            "unknown_command",
+            "unknown_error",
+            "no_such_run",
+            "no_such_subscription",
+            "no_such_interrupt",
+            "permission_denied",
+        }
+        assert emitted <= official

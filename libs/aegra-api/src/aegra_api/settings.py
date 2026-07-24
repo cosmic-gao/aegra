@@ -313,6 +313,20 @@ class ObservabilitySettings(EnvBase):
     OTEL_TARGETS: str = ""  # Comma-separated: "LANGFUSE,PHOENIX"
     OTEL_CONSOLE_EXPORT: bool = False  # For local debugging
 
+    # --- LLM I/O redaction (PII / compliance) ---
+    # Redact LLM prompts/completions (end-user messages, tool inputs) before
+    # export. Off keeps current behavior; when off we defer to OpenInference's
+    # native OPENINFERENCE_HIDE_* env vars rather than forcing redaction off.
+    OTEL_HIDE_LLM_INPUTS: bool = False
+    OTEL_HIDE_LLM_OUTPUTS: bool = False
+
+    # --- Trace sampling ---
+    # Standard OTEL sampler. Empty keeps the SDK default (parentbased_always_on
+    # → export all). trace_id is derived from run_id, so ratio sampling stays
+    # consistent per run and never splits a single run's trace.
+    OTEL_TRACES_SAMPLER: str = ""
+    OTEL_TRACES_SAMPLER_ARG: float = 1.0
+
     # --- Generic OTLP Target (Default/Custom) ---
     OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
     OTEL_EXPORTER_OTLP_HEADERS: str | None = None
@@ -446,7 +460,7 @@ class EventStreamingSettings(EnvBase):
 
 
 class WebhookSettings(EnvBase):
-    """Outbound run-completion webhook delivery."""
+    """Outbound run-completion webhook delivery via a transactional outbox."""
 
     WEBHOOK_ENABLED: bool = True
     WEBHOOK_TIMEOUT_SECONDS: float = 30.0
@@ -470,6 +484,16 @@ class A2ASettings(EnvBase):
     """A2A protocol endpoints (/a2a/{assistant_id}) exposing assistants as agents."""
 
     A2A_ENABLED: bool = True
+
+
+class RunTTLSettings(EnvBase):
+    """Run-row retention (TTL). Opt-in; prunes old terminal run rows so the
+    ``runs`` table doesn't grow unbounded. Thread state + checkpoints are
+    untouched — only historical run rows past the age are deleted.
+    """
+
+    RUN_TTL_ENABLED: bool = False
+    RUN_TTL_MINUTES: int = 10080  # 7 days
 
 
 class CheckpointerSettings(EnvBase):
@@ -503,6 +527,7 @@ class Settings:
         self.webhook = WebhookSettings()
         self.mcp = McpSettings()
         self.a2a = A2ASettings()
+        self.run_ttl = RunTTLSettings()
         self.checkpointer = CheckpointerSettings()
 
 

@@ -228,6 +228,136 @@ class TestSignalEndEvent:
             await _signal_end_event("run-1", "success")
 
 
+def _session_maker(session: AsyncMock) -> MagicMock:
+    """Wrap a mock session in a context-manager-returning maker."""
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=ctx)
+
+
+class TestReadState:
+    """P0-3: the checkpointer snapshot — not the stream output — is the
+    materialization source."""
+
+    @pytest.mark.asyncio
+    async def test_returns_serialized_values_and_interrupts(self) -> None:
+        from aegra_api.services.run_executor import _read_state
+
+        snapshot = MagicMock()
+        snapshot.values = {"messages": ["hi"]}
+        snapshot.tasks = ()
+        graph = MagicMock()
+        graph.aget_state = AsyncMock(return_value=snapshot)
+
+        values, interrupts = await _read_state(graph, {}, "run-1")
+
+        assert values == {"messages": ["hi"]}
+        assert interrupts == {}
+
+    @pytest.mark.asyncio
+    async def test_returns_none_values_on_read_failure(self) -> None:
+        # Regression: a failed read must NOT yield {} (finalize would materialize
+        # it and wipe real state) — it yields None so finalize skips materialization.
+        from aegra_api.services.run_executor import _read_state
+
+        graph = MagicMock()
+        graph.aget_state = AsyncMock(side_effect=RuntimeError("checkpointer down"))
+
+        values, interrupts = await _read_state(graph, {}, "run-1")
+
+        assert values is None
+        assert interrupts == {}
+
+
+class TestExecuteRunMaterializesFromCheckpointer:
+    @pytest.mark.asyncio
+    async def test_success_passes_checkpointer_values_not_stream_output(self) -> None:
+        """Regression (P0-3): finalize's materialization source is the checkpointer
+        snapshot; the (possibly empty) stream output only feeds run.output."""
+        from aegra_api.services.run_executor import _GraphResult, execute_run
+
+        graph_result = _GraphResult()
+        graph_result.data = {}  # empty stream output (non-'values' stream mode)
+        graph_result.state_values = {"real": 1}  # checkpointer truth
+        mock_finalize = AsyncMock()
+
+        with (
+            patch("aegra_api.services.run_executor.update_run_status", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor.finalize_run", mock_finalize),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock, return_value=graph_result),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            await execute_run(_make_job())
+
+        assert mock_finalize.await_args.kwargs["status"] == "success"
+        assert mock_finalize.await_args.kwargs["state_values"] == {"real": 1}
+        # run.output still gets the empty stream output — a separate concern
+        assert mock_finalize.await_args.kwargs["output"] == {}
+
+
+class TestShutdownCancellation:
+    """P0-4: graceful-shutdown cancel hands the run off, never writes a terminal
+    'interrupted' a rolling upgrade could not resume."""
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancel_reverts_to_pending_not_interrupted(self) -> None:
+        mock_finalize = AsyncMock()
+        mock_release = AsyncMock()
+        mock_signal_done = AsyncMock()
+
+        with (
+            patch("aegra_api.services.run_executor.update_run_status", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor.finalize_run", mock_finalize),
+            patch("aegra_api.services.run_executor._release_for_recovery", mock_release),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._signal_run_done", mock_signal_done),
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError,
+            ),
+        ):
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            mock_streaming.cleanup_run = AsyncMock()
+
+            from aegra_api.services.run_executor import _shutdown_cancellations, execute_run
+
+            _shutdown_cancellations.add("run-1")
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await execute_run(_make_job())
+            finally:
+                _shutdown_cancellations.discard("run-1")
+
+        # Reverted to pending for recovery — NOT finalized interrupted
+        mock_release.assert_awaited_once_with("run-1")
+        mock_finalize.assert_not_awaited()
+        # Handed off: no cancel signal, no done-key, no broker cleanup
+        mock_streaming.signal_run_cancelled.assert_not_awaited()
+        mock_signal_done.assert_not_awaited()
+        mock_streaming.cleanup_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_release_for_recovery_reverts_running_run_to_pending(self) -> None:
+        from aegra_api.services.run_executor import _release_for_recovery
+
+        session = AsyncMock()
+        maker = _session_maker(session)
+        with patch("aegra_api.services.run_executor._get_session_maker", return_value=maker):
+            await _release_for_recovery("run-1")
+
+        session.execute.assert_awaited_once()
+        session.commit.assert_awaited_once()
+        # SET status='pending' guarded on WHERE status='running'
+        params = list(session.execute.await_args.args[0].compile().params.values())
+        assert "pending" in params
+        assert "running" in params
+
+
 class TestSignalRunDone:
     @pytest.mark.asyncio
     async def test_sets_redis_key(self) -> None:

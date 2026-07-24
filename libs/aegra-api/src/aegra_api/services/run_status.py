@@ -12,15 +12,17 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import ThreadState as ThreadStateORM
+from aegra_api.core.orm import WebhookDelivery as WebhookDeliveryORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.models.enums import TERMINAL_RUN_STATUSES
 from aegra_api.settings import settings
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
 
@@ -56,9 +58,7 @@ async def materialize_thread_state(
     if not settings.checkpointer.THREAD_STATE_MATERIALIZE:
         return
     new_hash = _values_hash(values)
-    current = await session.scalar(
-        select(ThreadStateORM.values_hash).where(ThreadStateORM.thread_id == thread_id)
-    )
+    current = await session.scalar(select(ThreadStateORM.values_hash).where(ThreadStateORM.thread_id == thread_id))
     now = datetime.now(UTC)
     insert = pg_insert(ThreadStateORM).values(
         thread_id=thread_id, values=values, interrupts=interrupts, values_hash=new_hash, updated_at=now
@@ -126,13 +126,21 @@ async def finalize_run(
     output: Any = None,
     error: str | None = None,
     interrupts: dict[str, list[Any]] | None = None,
-) -> None:
-    """Update run status + thread status in a single transaction.
+    state_values: dict[str, Any] | None = None,
+    webhook: str | None = None,
+) -> bool:
+    """Compare-and-set run + thread status in one transaction; return whether this won.
 
-    Batches two UPDATE statements into one DB round-trip instead of
-    opening separate sessions for update_run_status and set_thread_status.
-    ``interrupts`` is the SDK task-keyed map (``{task_id: [...]}``); it defaults
-    to ``{}`` so completing a run clears any pending interrupts on the thread.
+    The run UPDATE is guarded on a non-terminal status, so a second concurrent
+    finalizer (a lease-loss double-execution) matches zero rows and returns
+    ``False`` — letting callers gate one-shot side effects (webhooks) on winning.
+
+    Thread state is materialized from ``state_values`` (the checkpointer snapshot),
+    which is ``None`` on cancel/error/timeout so those skip materialization and
+    leave real state intact. ``output`` persists to ``run.output`` regardless.
+
+    A ``webhook`` URL enqueues a delivery row in this same transaction (outbox),
+    so the notification is durable the instant the run is terminal.
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -146,25 +154,39 @@ async def finalize_run(
         "status": validated_thread,
         "updated_at": datetime.now(UTC),
     }
-    state: tuple[dict[str, Any], dict[str, Any]] | None = None
     if output is not None:
-        serialized, ok = _safe_serialize(output, run_id)
-        run_values["output"] = serialized
-        # Materialize into thread_state (not the thread row) only for genuinely
-        # serialized dict state — never the _safe_serialize failure fallback.
-        if ok and isinstance(serialized, dict):
-            state = (serialized, interrupts or {})
+        run_values["output"], _ = _safe_serialize(output, run_id)
     if error is not None:
         run_values["error_message"] = error
 
+    state: tuple[dict[str, Any], dict[str, Any]] | None = None
+    if state_values is not None:
+        state = (state_values, interrupts or {})
+
     async with maker() as session:
-        await session.execute(update(RunORM).where(RunORM.run_id == run_id).values(**run_values))
-        await session.execute(update(ThreadORM).where(ThreadORM.thread_id == thread_id).values(**thread_values))
-        if state is not None:
-            await materialize_thread_state(session, thread_id, state[0], state[1])
+        result = cast(
+            CursorResult,
+            await session.execute(
+                update(RunORM)
+                .where(RunORM.run_id == run_id, RunORM.status.notin_(TERMINAL_RUN_STATUSES))
+                .values(**run_values)
+            ),
+        )
+        won = result.rowcount > 0
+        if won:
+            # A loser leaves the winner's thread status + materialized state intact.
+            await session.execute(update(ThreadORM).where(ThreadORM.thread_id == thread_id).values(**thread_values))
+            if state is not None:
+                await materialize_thread_state(session, thread_id, state[0], state[1])
+            if webhook and settings.webhook.WEBHOOK_ENABLED:
+                await session.execute(insert(WebhookDeliveryORM).values(run_id=run_id, url=webhook))
         await session.commit()
 
-    logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)
+    if won:
+        logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)
+    else:
+        logger.info("Finalize skipped; run already terminal", run_id=run_id, attempted_status=validated_run)
+    return won
 
 
 def _safe_serialize(output: Any, run_id: str) -> tuple[Any, bool]:

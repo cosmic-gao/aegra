@@ -6,13 +6,14 @@ Mirrors LangGraph Platform's A2A surface: a per-assistant JSON-RPC endpoint at
 with v0.3 compatibility enabled so platform-era clients (``message/send``) work.
 
 Every request authenticates through the same auth backend as the REST API
-(``require_auth``), and graphs execute under the caller's identity. Routes are
+(``require_auth``), and — like the REST run path — dispatches ``@auth.on`` authorization
+(``threads.create_run``) before the graph runs under the caller's identity. Routes are
 returned by :func:`a2a_routes` for the app factory to append to the router.
 """
 
 import functools
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import structlog
@@ -48,6 +49,7 @@ from starlette.routing import BaseRoute, Route
 
 from aegra_api import __version__
 from aegra_api.core.auth_deps import require_auth
+from aegra_api.core.auth_handlers import build_auth_context, handle_event, merge_auth_filters
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.auth import User
 from aegra_api.observability.span_enrichment import bind_run_trace_context
@@ -136,6 +138,17 @@ class AegraAgentExecutor(AgentExecutor):
         if not graph_id or graph_id not in service.list_graphs():
             raise ValueError(f"Unknown assistant '{graph_id}'")
 
+        graph_input = {"messages": [{"role": "user", "content": context.get_user_input()}]}
+        thread_id = str(uuid4())
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        run_context: dict[str, Any] = {}
+        # Authorization dispatch mirrors api/runs.create_run (threads.create_run):
+        # deny raises before task creation; allow may inject run config/context.
+        auth_ctx = build_auth_context(user, "threads", "create_run") if user is not None else None
+        auth_value: dict[str, Any] = {"assistant_id": graph_id, "thread_id": thread_id, "input": graph_input}
+        filters = await handle_event(auth_ctx, auth_value)
+        merge_auth_filters(config, run_context, filters, auth_value)
+
         task = context.current_task
         if task is None:
             history = [context.message] if context.message is not None else None
@@ -150,9 +163,6 @@ class AegraAgentExecutor(AgentExecutor):
         updater = TaskUpdater(event_queue, task.id, task.context_id)
         await updater.start_work()
 
-        graph_input = {"messages": [{"role": "user", "content": context.get_user_input()}]}
-        thread_id = str(uuid4())
-        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
         # Inline ainvoke bypasses the executor's trace setup, so bind here or the
         # Langfuse trace lands without user/session/name enrichment.
         bind_run_trace_context(
@@ -163,8 +173,8 @@ class AegraAgentExecutor(AgentExecutor):
             extra_metadata={"source": "a2a", "a2a_context_id": task.context_id},
         )
         try:
-            async with service.get_graph(graph_id, user=user) as graph:
-                result = await graph.ainvoke(graph_input, config)
+            async with service.get_graph(graph_id, config=config, user=user, context=run_context or None) as graph:
+                result = await graph.ainvoke(graph_input, cast(RunnableConfig, config))
         except Exception as exc:  # graph code may raise anything; surface a failed task
             logger.exception("a2a_graph_execution_failed", assistant=graph_id)
             await updater.failed(message=updater.new_agent_message([new_text_part(str(exc))]))

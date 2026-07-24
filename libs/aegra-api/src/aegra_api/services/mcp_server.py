@@ -5,8 +5,9 @@ LangGraph Platform MCP endpoint: **each graph is exposed as its own tool** whose
 name is the graph id and whose input schema is the graph's input schema, rather
 than a pair of generic ``list_assistants``/``run_assistant`` tools. Tools run
 under the caller's identity (same auth backend as the REST API), each call is
-stateless (a fresh thread per invocation), and ``@auth.on`` authorization
-applies. A no-auth deployment resolves to the anonymous user.
+stateless (a fresh thread per invocation), and — like the REST run path —
+``@auth.on`` authorization (``threads.create_run``) is dispatched before the graph
+runs. A no-auth deployment resolves to the anonymous user.
 
 FastMCP infers a tool's schema from a Python signature, so to advertise each
 graph's own JSON schema we register ``list_tools``/``call_tool`` handlers on the
@@ -16,7 +17,7 @@ Streamable HTTP transport (``streamable_http_app``).
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import structlog
@@ -26,6 +27,7 @@ from mcp import types
 from mcp.server.fastmcp import FastMCP
 
 from aegra_api.core.auth_deps import require_auth
+from aegra_api.core.auth_handlers import build_auth_context, handle_event, merge_auth_filters
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.auth import User
 from aegra_api.observability.span_enrichment import bind_run_trace_context
@@ -107,7 +109,14 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
     if name not in service.list_graphs():
         raise ValueError(f"Unknown assistant '{name}'")
     thread_id = str(uuid4())
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    run_context: dict[str, Any] = {}
+    # Authorization dispatch mirrors api/runs.create_run (threads.create_run):
+    # deny raises before execution; allow may inject run config/context.
+    auth_ctx = build_auth_context(user, "threads", "create_run")
+    auth_value: dict[str, Any] = {"assistant_id": name, "thread_id": thread_id, "input": arguments}
+    filters = await handle_event(auth_ctx, auth_value)
+    merge_auth_filters(config, run_context, filters, auth_value)
     # Inline ainvoke bypasses the executor's trace setup, so bind here or the
     # Langfuse trace lands without user/session/name enrichment.
     bind_run_trace_context(
@@ -117,8 +126,8 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
         user_identity=user.identity if user else None,
         extra_metadata={"source": "mcp"},
     )
-    async with service.get_graph(name, user=user) as graph:
-        result = await graph.ainvoke(arguments, config)
+    async with service.get_graph(name, config=config, user=user, context=run_context or None) as graph:
+        result = await graph.ainvoke(arguments, cast(RunnableConfig, config))
     payload = _serializer.serialize(result)
     return [types.TextContent(type="text", text=json.dumps(payload, default=str))]
 
